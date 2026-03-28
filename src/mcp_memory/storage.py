@@ -53,6 +53,18 @@ class MemoryStore:
                 "Embedding operations will be unavailable."
             )
 
+        # --- Check FTS5 availability ---
+        self._fts_available: bool = False
+        try:
+            self.db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS _fts_test USING fts5(dummy);"
+            )
+            self.db.execute("DROP TABLE IF EXISTS _fts_test;")
+            self._fts_available = True
+            logger.info("FTS5 extension available.")
+        except Exception:
+            logger.warning("FTS5 not available. Full-text search will be disabled.")
+
     def close(self) -> None:
         """Close the database connection."""
         self.db.close()
@@ -138,6 +150,27 @@ class MemoryStore:
             except Exception as exc:
                 logger.error("Failed to create vec0 table: %s", exc)
 
+        # FTS5 full-text search table (best-effort)
+        if self._fts_available:
+            try:
+                cur.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
+                    USING fts5(name, entity_type, obs_text, tokenize="unicode61");
+                    """
+                )
+                logger.info("entity_fts virtual table created.")
+
+                # Backfill from existing entities if FTS table is empty
+                fts_count = cur.execute("SELECT COUNT(*) FROM entity_fts").fetchone()[0]
+                entity_count = cur.execute("SELECT COUNT(*) FROM entities").fetchone()[
+                    0
+                ]
+                if fts_count == 0 and entity_count > 0:
+                    self._backfill_fts()
+            except Exception as exc:
+                logger.error("Failed to create FTS5 table: %s", exc)
+
         self.db.commit()
 
     # ------------------------------------------------------------------
@@ -160,7 +193,9 @@ class MemoryStore:
         row = self.db.execute(
             "SELECT id FROM entities WHERE name = ?", (name,)
         ).fetchone()
-        return row["id"]  # type: ignore[return-value]
+        entity_id = row["id"]  # type: ignore[return-value]
+        self._sync_fts(entity_id)
+        return entity_id
 
     def get_entity_by_name(self, name: str) -> dict | None:
         """Returns entity dict or None."""
@@ -227,7 +262,17 @@ class MemoryStore:
                 except Exception:
                     logger.warning("Could not delete embeddings for entities %s", ids)
 
-            # 2. Delete entities (CASCADE takes care of observations & relations)
+            # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
+            if self._fts_available:
+                try:
+                    self.db.execute(
+                        f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
+                        ids,
+                    )
+                except Exception:
+                    logger.warning("Could not delete FTS entries for entities %s", ids)
+
+            # 3. Delete entities (CASCADE takes care of observations & relations)
             self.db.execute(
                 f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
             )
@@ -284,6 +329,7 @@ class MemoryStore:
             inserted += 1
         if inserted:
             self.db.commit()
+            self._sync_fts(entity_id)
         return inserted
 
     def get_observations(self, entity_id: int) -> list[str]:
@@ -304,6 +350,7 @@ class MemoryStore:
             [entity_id, *observations],
         )
         self.db.commit()
+        self._sync_fts(entity_id)
         return cursor.rowcount
 
     # ------------------------------------------------------------------
@@ -361,6 +408,45 @@ class MemoryStore:
             }
             for r in rows
         ]
+
+    def get_relations_for_entity(self, entity_id: int) -> list[dict]:
+        """Get all relations for an entity (both from and to), with resolved entity names.
+
+        Returns list of dicts with relation_type, target_name, and direction.
+        For 'from' relations, target is the to_entity.
+        For 'to' relations, target is the from_entity.
+        """
+        rows = self.db.execute(
+            """
+            SELECT r.from_entity, r.to_entity, r.relation_type,
+                   e_from.name AS from_name, e_to.name AS to_name
+            FROM relations r
+            JOIN entities e_from ON r.from_entity = e_from.id
+            JOIN entities e_to ON r.to_entity = e_to.id
+            WHERE r.from_entity = ? OR r.to_entity = ?
+            """,
+            (entity_id, entity_id),
+        ).fetchall()
+
+        result = []
+        for r in rows:
+            if r["from_entity"] == entity_id:
+                result.append(
+                    {
+                        "relation_type": r["relation_type"],
+                        "target_name": r["to_name"],
+                        "direction": "from",
+                    }
+                )
+            else:
+                result.append(
+                    {
+                        "relation_type": r["relation_type"],
+                        "target_name": r["from_name"],
+                        "direction": "to",
+                    }
+                )
+        return result
 
     # ------------------------------------------------------------------
     # Embedding ops
@@ -556,6 +642,94 @@ class MemoryStore:
             for r in rows
             if r["entity_a_id"] in id_set and r["entity_b_id"] in id_set
         }
+
+    # ------------------------------------------------------------------
+    # Limbic: FTS5 full-text search
+    # ------------------------------------------------------------------
+
+    def _sync_fts(self, entity_id: int) -> None:
+        """Rebuild FTS index entry for an entity from current DB state.
+        Idempotent: INSERT OR REPLACE. No-op if FTS not available."""
+        if not self._fts_available:
+            return
+        try:
+            entity = self.get_entity_by_id(entity_id)
+            if not entity:
+                return
+            obs = self.get_observations(entity_id)
+            obs_text = " | ".join(obs)
+            self.db.execute(
+                "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
+                (entity_id, entity["name"], entity["entity_type"], obs_text),
+            )
+            self.db.commit()
+        except Exception as exc:
+            logger.warning("FTS sync failed for entity %s: %s", entity_id, exc)
+
+    def _delete_fts(self, entity_id: int) -> None:
+        """Delete FTS index entry for an entity."""
+        if not self._fts_available:
+            return
+        try:
+            self.db.execute("DELETE FROM entity_fts WHERE rowid = ?", (entity_id,))
+            self.db.commit()
+        except Exception as exc:
+            logger.warning("FTS delete failed for entity %s: %s", entity_id, exc)
+
+    def _backfill_fts(self) -> None:
+        """Populate FTS index from all existing entities. Called from init_db."""
+        try:
+            entities = self.db.execute(
+                "SELECT id, name, entity_type FROM entities"
+            ).fetchall()
+            if not entities:
+                return
+            for e in entities:
+                obs = self.get_observations(e["id"])
+                obs_text = " | ".join(obs)
+                self.db.execute(
+                    "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
+                    (e["id"], e["name"], e["entity_type"], obs_text),
+                )
+            self.db.commit()
+            logger.info("FTS index backfilled with %d entities.", len(entities))
+        except Exception as exc:
+            logger.error("FTS backfill failed: %s", exc)
+
+    def search_fts(self, query: str, limit: int = 10) -> list[dict]:
+        """FTS5 full-text search using BM25 ranking.
+
+        Searches across name, entity_type, and obs_text columns.
+        Returns list of {"entity_id": int, "rank": float} ordered by relevance (descending).
+        Returns empty list if FTS not available or query is empty.
+        """
+        if not self._fts_available or not query.strip():
+            return []
+        try:
+            # Escape FTS5 special characters: " * ( ) : ^
+            # Wrap each token in double quotes for exact matching
+            tokens = query.strip().split()
+            escaped = " ".join(f'"{t}"' for t in tokens if t)
+            if not escaped:
+                return []
+
+            rows = self.db.execute(
+                """
+                SELECT rowid AS entity_id, rank
+                FROM entity_fts
+                WHERE entity_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?;
+                """,
+                (escaped, limit),
+            ).fetchall()
+            # FTS5 rank is negative (lower = better). Negate for conventional ordering.
+            return [
+                {"entity_id": r["entity_id"], "rank": -float(r["rank"])} for r in rows
+            ]
+        except Exception as exc:
+            logger.warning("FTS5 search failed: %s", exc)
+            return []
 
     # ------------------------------------------------------------------
     # Read graph (Anthropic-compatible format)

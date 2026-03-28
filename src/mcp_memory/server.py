@@ -49,7 +49,8 @@ def _recompute_embedding(
     try:
         from mcp_memory.embeddings import serialize_f32
 
-        text = engine.prepare_entity_text(name, entity_type, observations)
+        relations = store.get_relations_for_entity(entity_id)
+        text = engine.prepare_entity_text(name, entity_type, observations, relations)
         vector = engine.encode([text])
         store.store_embedding(entity_id, serialize_f32(vector[0]))
     except Exception as e:
@@ -100,6 +101,7 @@ def create_entities(entities: list[dict[str, Any]]) -> dict[str, Any]:
 
         return {"entities": results}
     except Exception as e:
+        logger.error("Error in create_entities: %s", e)
         return {"error": str(e)}
 
 
@@ -154,6 +156,7 @@ def create_relations(relations: list[dict[str, Any]]) -> dict[str, Any]:
             return {"relations": results, "errors": errors}
         return {"relations": results}
     except Exception as e:
+        logger.error("Error in create_relations: %s", e)
         return {"error": str(e)}
 
 
@@ -187,6 +190,7 @@ def add_observations(name: str, observations: list[str]) -> dict[str, Any]:
             }
         }
     except Exception as e:
+        logger.error("Error in add_observations: %s", e)
         return {"error": str(e)}
 
 
@@ -214,6 +218,7 @@ def delete_entities(entityNames: list[str]) -> dict[str, Any]:
             result["errors"] = errors
         return result
     except Exception as e:
+        logger.error("Error in delete_entities: %s", e)
         return {"error": str(e)}
 
 
@@ -244,6 +249,7 @@ def delete_observations(name: str, observations: list[str]) -> dict[str, Any]:
             }
         }
     except Exception as e:
+        logger.error("Error in delete_observations: %s", e)
         return {"error": str(e)}
 
 
@@ -291,6 +297,7 @@ def delete_relations(relations: list[dict[str, Any]]) -> dict[str, Any]:
             result["errors"] = errors
         return result
     except Exception as e:
+        logger.error("Error in delete_relations: %s", e)
         return {"error": str(e)}
 
 
@@ -301,6 +308,8 @@ def delete_relations(relations: list[dict[str, Any]]) -> dict[str, Any]:
 def search_nodes(query: str) -> dict[str, Any]:
     """Search for nodes in the knowledge graph by name, type, or observation content."""
     try:
+        if not query.strip():
+            return {"entities": []}
         entities = store.search_entities(query)
         results = []
         for entity in entities:
@@ -308,6 +317,7 @@ def search_nodes(query: str) -> dict[str, Any]:
             results.append(_entity_to_output(entity, obs))
         return {"entities": results}
     except Exception as e:
+        logger.error("Error in search_nodes: %s", e)
         return {"error": str(e)}
 
 
@@ -319,15 +329,26 @@ def open_nodes(names: list[str]) -> dict[str, Any]:
     """Open specific nodes by name. Returns full entity data with observations."""
     try:
         results = []
+        opened_ids = []
         for name in names:
             entity = store.get_entity_by_name(name)
             if entity:
                 obs = store.get_observations(entity["id"])
                 # Limbic: record access on node open
                 store.record_access(entity["id"])
+                opened_ids.append(entity["id"])
                 results.append(_entity_to_output(entity, obs))
+
+        # Limbic: record co-occurrences for entities opened together (best-effort)
+        try:
+            if len(opened_ids) >= 2:
+                store.record_co_occurrences(opened_ids)
+        except Exception as e:
+            logger.warning("Limbic co-occurrence tracking failed: %s", e)
+
         return {"entities": results}
     except Exception as e:
+        logger.error("Error in open_nodes: %s", e)
         return {"error": str(e)}
 
 
@@ -340,6 +361,7 @@ def read_graph() -> dict[str, Any]:
     try:
         return store.read_graph()
     except Exception as e:
+        logger.error("Error in read_graph: %s", e)
         return {"error": str(e)}
 
 
@@ -348,7 +370,9 @@ def read_graph() -> dict[str, Any]:
 # ============================================================
 @mcp.tool
 def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
-    """Semantic search using vector embeddings. Finds entities most similar to the query.
+    """Semantic search using vector embeddings with optional full-text hybrid search.
+    Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion,
+    then applies limbic re-ranking based on access patterns and co-occurrence.
     Requires the embedding model to be downloaded (run download_model.py first)."""
     try:
         engine = _get_engine()
@@ -358,45 +382,70 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             }
 
         from mcp_memory.embeddings import serialize_f32
-        from mcp_memory.scoring import EXPANSION_FACTOR, rank_candidates
+        from mcp_memory.scoring import (
+            EXPANSION_FACTOR,
+            rank_candidates,
+            rank_hybrid_candidates,
+            reciprocal_rank_fusion,
+        )
 
-        # Encode query
-        query_vector = engine.encode([query])
+        # --- Step 1: Semantic KNN search ---
+        query_vector = engine.encode([query], task="query")
         query_bytes = serialize_f32(query_vector[0])
-
-        # KNN search with expansion factor (over-retrieve candidates)
         expanded_limit = limit * EXPANSION_FACTOR
         knn_results = store.search_embeddings(query_bytes, limit=expanded_limit)
 
         if not knn_results:
             return {"results": []}
 
-        # Collect candidate IDs
-        candidate_ids = [r["entity_id"] for r in knn_results]
+        # --- Step 2: FTS5 full-text search (best-effort) ---
+        fts_results = store.search_fts(query, limit=expanded_limit)
 
-        # Fetch limbic signals for all candidates
+        # --- Step 3: Merge via RRF (hybrid) or pure semantic (fallback) ---
+        use_hybrid = len(fts_results) > 0
+
+        if use_hybrid:
+            # RRF merge of semantic + FTS5 rankings
+            merged = reciprocal_rank_fusion(knn_results, fts_results)
+            # Collect all candidate IDs from merged results
+            candidate_ids = [r["entity_id"] for r in merged]
+        else:
+            # Pure semantic — use original KNN results
+            merged = None
+            candidate_ids = [r["entity_id"] for r in knn_results]
+
+        # --- Step 4: Fetch limbic signals for all candidates ---
         access_data = store.get_access_data(candidate_ids)
         degree_data = store.get_entity_degrees(candidate_ids)
         cooc_data = store.get_co_occurrences(candidate_ids)
 
-        # Fetch created_at for temporal factor
         entity_created: dict[int, str] = {}
         for eid in candidate_ids:
             row = store.get_entity_by_id(eid)
             if row:
                 entity_created[eid] = row["created_at"]
 
-        # Re-rank with limbic scoring (Opción B)
-        ranked = rank_candidates(
-            knn_results=knn_results,
-            access_data=access_data,
-            degree_data=degree_data,
-            cooc_data=cooc_data,
-            entity_created=entity_created,
-            limit=limit,
-        )
+        # --- Step 5: Re-rank with limbic scoring ---
+        if use_hybrid:
+            ranked = rank_hybrid_candidates(
+                merged_results=merged,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+            )
+        else:
+            ranked = rank_candidates(
+                knn_results=knn_results,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+            )
 
-        # Build output (same format as before)
+        # --- Step 6: Build output ---
         output = []
         top_k_ids = []
         for item in ranked:
@@ -406,14 +455,27 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                 continue
 
             obs = store.get_observations(eid)
-            output.append(
-                {
-                    "name": row["name"],
-                    "entityType": row["entity_type"],
-                    "observations": obs,
-                    "distance": round(item["distance"], 4),
-                }
-            )
+            result_item = {
+                "name": row["name"],
+                "entityType": row["entity_type"],
+                "observations": obs,
+                "limbic_score": round(item["limbic_score"], 4),
+                "scoring": {
+                    "importance": round(item["importance"], 4),
+                    "temporal_factor": round(item["temporal_factor"], 4),
+                    "cooc_boost": round(item["cooc_boost"], 4),
+                },
+            }
+
+            # Add distance if available (semantic results have it, FTS-only don't)
+            if item.get("distance") is not None:
+                result_item["distance"] = round(item["distance"], 4)
+
+            # Add rrf_score if hybrid mode
+            if use_hybrid and item.get("rrf_score") is not None:
+                result_item["rrf_score"] = round(item["rrf_score"], 6)
+
+            output.append(result_item)
             top_k_ids.append(eid)
 
         # Limbic: record access + co-occurrences for top-K (post-response, best-effort)
@@ -428,6 +490,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
         return {"results": output}
 
     except Exception as e:
+        logger.error("Error in search_semantic: %s", e)
         return {"error": str(e)}
 
 
@@ -452,6 +515,7 @@ def migrate(
         result = migrate_jsonl(store, source_path, engine)
         return result
     except Exception as e:
+        logger.error("Error in migrate: %s", e)
         return {"error": str(e)}
 
 

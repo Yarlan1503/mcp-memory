@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MCP Memory server with SQLite + semantic search"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=2.0",
+    "fastmcp>=3.0",
     "pydantic>=2.0",
     "numpy>=1.26",
     "sqlite-vec>=0.1.6",

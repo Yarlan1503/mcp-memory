@@ -13,9 +13,13 @@ from datetime import datetime, timezone
 BETA_SAL = 0.5  # Salience boost factor
 BETA_DEG = 0.15  # Degree weight
 D_MAX = 15  # Degree cap
-LAMBDA_HOURLY = 0.001  # Decay rate per hour (half-life ~29 days)
-GAMMA = 0.1  # Co-occurrence weight per pair
+LAMBDA_HOURLY = 0.0001  # Decay rate per hour (half-life ~290 days)
+GAMMA = (
+    0.01  # Co-occurrence weight per pair (reduced from 0.1 — 0.1 dominated scoring 24x)
+)
 EXPANSION_FACTOR = 3  # KNN over-retrieval factor
+TEMPORAL_FLOOR = 0.1  # Temporal decay never drops below this (knowledge degrades but isn't destroyed)
+RRF_K = 60  # RRF constant (default from original paper)
 
 
 # ------------------------------------------------------------------
@@ -51,7 +55,7 @@ def compute_importance(
 def compute_temporal_factor(last_access_str: str, created_at_str: str) -> float:
     """Compute temporal decay factor.
 
-    temporal_factor(e) = exp(-λ × Δt_hours)
+    temporal_factor(e) = max(TEMPORAL_FLOOR, exp(-LAMBDA_HOURLY × Δt_hours))
 
     Uses last_access if available, otherwise created_at.
     """
@@ -65,7 +69,7 @@ def compute_temporal_factor(last_access_str: str, created_at_str: str) -> float:
 
     now = datetime.now(timezone.utc)
     delta_hours = max(0.0, (now - dt).total_seconds() / 3600.0)
-    return math.exp(-LAMBDA_HOURLY * delta_hours)
+    return max(TEMPORAL_FLOOR, math.exp(-LAMBDA_HOURLY * delta_hours))
 
 
 def compute_cooc_boost(
@@ -86,6 +90,60 @@ def compute_cooc_boost(
         if co_count > 0:
             total += math.log2(1 + co_count)
     return total
+
+
+def reciprocal_rank_fusion(
+    semantic_results: list[dict],
+    fts_results: list[dict],
+    k: int = RRF_K,
+) -> list[dict]:
+    """Merge results from semantic (KNN) and FTS5 search using Reciprocal Rank Fusion.
+
+    RRF formula: score(d) = Σ 1/(k + rank_i(d))
+    where rank_i(d) is the 1-based position of document d in ranking i.
+
+    If a document appears in only one ranking, it only gets a score from that system.
+    Documents present in both rankings get a boost.
+
+    Args:
+        semantic_results: [{"entity_id": int, "distance": float}] ordered by relevance
+            (distance ascending = more similar first, as returned by sqlite-vec KNN).
+        fts_results: [{"entity_id": int, "rank": float}] ordered by relevance
+            (rank descending = more relevant first, as returned by search_fts).
+        k: RRF smoothing constant (default 60). Higher = less weight on rank position.
+
+    Returns:
+        List of dicts sorted by rrf_score descending.
+        Each dict: {"entity_id": int, "rrf_score": float, "distance": float | None}
+        distance is populated for entities found in semantic_results, None otherwise.
+    """
+    rrf_scores: dict[int, float] = {}
+    distances: dict[int, float] = {}
+
+    # Semantic ranking: 1-based position by distance (ascending)
+    for rank_pos, item in enumerate(semantic_results, start=1):
+        eid = item["entity_id"]
+        rrf_scores[eid] = rrf_scores.get(eid, 0.0) + 1.0 / (k + rank_pos)
+        distances[eid] = item["distance"]
+
+    # FTS5 ranking: 1-based position by rank (descending = already ordered)
+    for rank_pos, item in enumerate(fts_results, start=1):
+        eid = item["entity_id"]
+        rrf_scores[eid] = rrf_scores.get(eid, 0.0) + 1.0 / (k + rank_pos)
+
+    # Build sorted results
+    merged = []
+    for eid, score in rrf_scores.items():
+        merged.append(
+            {
+                "entity_id": eid,
+                "rrf_score": score,
+                "distance": distances.get(eid),
+            }
+        )
+
+    merged.sort(key=lambda x: x["rrf_score"], reverse=True)
+    return merged
 
 
 # ------------------------------------------------------------------
@@ -170,10 +228,124 @@ def rank_candidates(
                 "entity_id": eid,
                 "distance": distance,
                 "limbic_score": limbic_score,
+                "importance": importance,
+                "temporal_factor": temporal,
+                "cooc_boost": cooc,
             }
         )
 
     # Sort by limbic_score descending
     scored.sort(key=lambda x: x["limbic_score"], reverse=True)
 
+    return scored[:limit]
+
+
+def rank_hybrid_candidates(
+    merged_results: list[dict],
+    access_data: dict[int, dict],
+    degree_data: dict[int, int],
+    cooc_data: dict[tuple[int, int], int],
+    entity_created: dict[int, str],
+    limit: int,
+) -> list[dict]:
+    """Re-rank RRF-merged candidates using limbic scoring.
+
+    Like rank_candidates, but uses rrf_score (normalized) as the base relevance
+    instead of cosine similarity from KNN distance.
+
+    For entities with KNN distance available:
+        base_relevance = cosine_sim = max(0.0, 1.0 - distance)
+    For FTS-only entities (distance is None):
+        base_relevance = min-max normalized rrf_score across the batch
+
+    score(e) = base_relevance(e)
+              × (1 + β_sal × importance(e))
+              × temporal_factor(e)
+              × (1 + γ · cooc_boost(e, R))
+
+    Args:
+        merged_results: [{"entity_id": int, "rrf_score": float, "distance": float | None}]
+            from reciprocal_rank_fusion(), ordered by rrf_score.
+        access_data: {entity_id: {"access_count": int, "last_access": str}}.
+        degree_data: {entity_id: degree_count}.
+        cooc_data: {(id_a, id_b): co_count}.
+        entity_created: {entity_id: created_at_str}.
+        limit: Number of results to return (top-K).
+
+    Returns:
+        Top-K candidates sorted by limbic_score (descending).
+        Each item: {"entity_id", "distance" (or None), "rrf_score", "limbic_score",
+                     "importance", "temporal_factor", "cooc_boost"}.
+    """
+    if not merged_results:
+        return []
+
+    # Normalize RRF scores to [0, 1] for FTS-only entities
+    rrf_values = [r["rrf_score"] for r in merged_results]
+    rrf_min = min(rrf_values) if rrf_values else 0.0
+    rrf_max = max(rrf_values) if rrf_values else 1.0
+    rrf_range = rrf_max - rrf_min if rrf_max != rrf_min else 1.0
+
+    # Compute max_access for importance normalization
+    max_access = max(
+        (
+            access_data.get(r["entity_id"], {}).get("access_count", 0)
+            for r in merged_results
+        ),
+        default=0,
+    )
+
+    all_ids = [r["entity_id"] for r in merged_results]
+
+    scored = []
+    for item in merged_results:
+        eid = item["entity_id"]
+        distance = item["distance"]
+        rrf_score = item["rrf_score"]
+
+        # 1. Base relevance
+        if distance is not None:
+            # Entity found by KNN — use cosine similarity
+            base_relevance = max(0.0, 1.0 - distance)
+        else:
+            # FTS-only entity — use normalized RRF score
+            # Map to [0.2, 0.8] range to avoid extremes
+            norm_rrf = (rrf_score - rrf_min) / rrf_range
+            base_relevance = 0.2 + 0.6 * norm_rrf
+
+        # 2. Importance
+        ad = access_data.get(eid, {})
+        importance = compute_importance(
+            access_count=ad.get("access_count", 0),
+            max_access=max_access,
+            degree=degree_data.get(eid, 0),
+        )
+
+        # 3. Temporal factor
+        temporal = compute_temporal_factor(
+            last_access_str=ad.get("last_access", ""),
+            created_at_str=entity_created.get(eid, ""),
+        )
+
+        # 4. Co-occurrence boost
+        cooc = compute_cooc_boost(eid, all_ids, cooc_data)
+
+        # Product of all factors (same formula as rank_candidates)
+        limbic_score = (
+            base_relevance * (1 + BETA_SAL * importance) * temporal * (1 + GAMMA * cooc)
+        )
+
+        scored.append(
+            {
+                "entity_id": eid,
+                "distance": distance,
+                "rrf_score": rrf_score,
+                "limbic_score": limbic_score,
+                "importance": importance,
+                "temporal_factor": temporal,
+                "cooc_boost": cooc,
+            }
+        )
+
+    scored.sort(key=lambda x: x["limbic_score"], reverse=True)
     return scored[:limit]

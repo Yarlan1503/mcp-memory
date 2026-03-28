@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ def migrate_jsonl(
 
     Returns: {"entities_imported": N, "relations_imported": N, "errors": N, "skipped": N}
     """
+    source_path = str(Path(source_path).expanduser())
     entities_imported = 0
     relations_imported = 0
     errors = 0
@@ -136,8 +138,9 @@ def migrate_jsonl(
                     continue
 
                 observations = store.get_observations(entity["id"])
+                relations = store.get_relations_for_entity(entity["id"])
                 text = engine.prepare_entity_text(
-                    entity["name"], entity["entity_type"], observations
+                    entity["name"], entity["entity_type"], observations, relations
                 )
                 vector = engine.encode([text])
 

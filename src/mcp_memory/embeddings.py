@@ -1,5 +1,6 @@
 """Singleton ONNX embedding engine for semantic search."""
 
+import re
 import struct
 import logging
 from pathlib import Path
@@ -9,8 +10,31 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path.home() / ".cache" / "mcp-memory-v2" / "models"
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_NAME = "intfloat/multilingual-e5-small"
 DIMENSION = 384
+
+# E5-small requires task prefixes for asymmetric retrieval
+QUERY_PREFIX = "query: "
+PASSAGE_PREFIX = "passage: "
+
+# Token budget constants for prepare_entity_text
+OVERHEAD_TOKENS = 25  # Tokens para "name (type): " + "Rel: ..." overhead
+MAX_TOKENS = 480  # Budget total (512 - buffer)
+CHARS_PER_TOKEN = 3.57  # Ratio empírico para español (~123 chars / 35 tokens)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using empirical chars/token ratio for Spanish."""
+    return max(1, int(len(text) / CHARS_PER_TOKEN))
+
+
+def _lexical_diversity(text: str) -> float:
+    """Compute lexical diversity: unique words / total words.
+    Higher = more diverse vocabulary."""
+    words = re.findall(r"\b\w+\b", text.lower())
+    if not words:
+        return 0.0
+    return len(set(words)) / len(words)
 
 
 class EmbeddingEngine:
@@ -108,18 +132,27 @@ class EmbeddingEngine:
         """Embedding dimensionality (384 for this model)."""
         return DIMENSION
 
-    def encode(self, texts: list[str]) -> np.ndarray:
+    def encode(self, texts: list[str], *, task: str = "passage") -> np.ndarray:
         """Encode *texts* into an L2-normalised ``(n, 384)`` float32 array.
 
-        Pipeline: tokenise → ONNX forward → mean-pool → L2-normalise.
+        Pipeline: prefix → tokenise → ONNX forward → mean-pool → L2-normalise.
+
+        The ``task`` parameter controls the E5-small prefix:
+        ``"query"`` for search queries, ``"passage"`` (default) for stored text.
 
         Raises ``RuntimeError`` if the model is not loaded.
         """
+        if not texts:
+            return np.empty((0, DIMENSION))
         if not self._available:
             raise RuntimeError("Embedding model not available")
 
+        # 0. Apply e5-small task prefix ----------------------------------
+        prefix = QUERY_PREFIX if task == "query" else PASSAGE_PREFIX
+        prefixed = [prefix + t for t in texts]
+
         # 1. Tokenise ---------------------------------------------------
-        encoded = self._tokenizer.encode_batch(texts)
+        encoded = self._tokenizer.encode_batch(prefixed)
 
         input_ids = np.array(
             [e.ids for e in encoded],
@@ -165,13 +198,104 @@ class EmbeddingEngine:
         name: str,
         entity_type: str,
         observations: list[str],
+        relations: list[dict] | None = None,
     ) -> str:
-        """Format an entity for embedding.
+        """Format an entity for embedding with Head+Tail+Diversity selection.
 
-        Returns ``"{name} ({entity_type}): {obs1}. {obs2}. ..."``
+        Strategy:
+        1. Head (first 3 obs): definitional, structural info
+        2. Tail (last 7 obs): most recent state
+        3. Middle: fill budget with most lexically diverse observations
+        4. Relations: append as context ("Rel: type -> target; ...")
+
+        Uses ` | ` separator between observations for semantic clarity.
+        Budget: MAX_TOKENS (480) estimated via CHARS_PER_TOKEN ratio.
         """
-        obs_text = ". ".join(observations)
-        return f"{name} ({entity_type}): {obs_text}"
+        if not observations:
+            base = f"{name} ({entity_type})"
+        else:
+            # Build relation context string
+            rel_parts: list[str] = []
+            rel_token_budget = 0
+            if relations:
+                for rel in relations:
+                    target = rel.get(
+                        "target_name", f"id:{rel.get('to_id', rel.get('from_id', '?'))}"
+                    )
+                    rel_type = rel.get("relation_type", "related_to")
+                    rel_parts.append(f"{rel_type} → {target}")
+
+            rel_text = ""
+            if rel_parts:
+                rel_text = " | Rel: " + "; ".join(rel_parts)
+                rel_token_budget = _estimate_tokens(rel_text)
+
+            # Available budget for observations
+            header = f"{name} ({entity_type}): "
+            header_tokens = _estimate_tokens(header)
+            obs_budget = MAX_TOKENS - OVERHEAD_TOKENS - header_tokens - rel_token_budget
+            obs_char_budget = int(obs_budget * CHARS_PER_TOKEN)
+
+            # --- Selection strategy ---
+            n = len(observations)
+
+            # Always take head (first 3)
+            head = observations[:3]
+
+            if n <= 3:
+                # Very few observations — use all
+                selected = list(observations)
+            elif n <= 10:
+                # Moderate — take head + tail (all remaining from end)
+                tail_count = min(7, n - 3)
+                tail = observations[-tail_count:]
+                # Middle = everything between head and tail
+                middle_start = 3
+                middle_end = n - tail_count
+                middle = observations[middle_start:middle_end]
+                selected = head + middle + tail
+            else:
+                # Many observations — Head + Tail + Diversity middle
+                tail = observations[-7:]
+                # Middle candidates = everything between head and tail
+                middle_candidates = observations[3:-7]
+
+                # Build output with head first
+                selected = list(head)
+                used_chars = sum(len(o) for o in selected) + 3 * 3  # 3 separators " | "
+
+                # Add tail (reserve space)
+                tail_chars = sum(len(o) for o in tail) + 7 * 3  # 7 separators
+                remaining_chars = obs_char_budget - used_chars - tail_chars
+
+                # Sort middle candidates by lexical diversity (descending)
+                middle_scored = sorted(
+                    middle_candidates,
+                    key=_lexical_diversity,
+                    reverse=True,
+                )
+
+                # Fill remaining budget with most diverse middle observations
+                diverse_middle: list[str] = []
+                for obs in middle_scored:
+                    obs_cost = len(obs) + 3  # +3 for separator
+                    if remaining_chars >= obs_cost:
+                        diverse_middle.append(obs)
+                        remaining_chars -= obs_cost
+                    if remaining_chars < 20:  # minimum useful observation
+                        break
+
+                # Re-order diverse_middle by original position for coherence
+                middle_set = set(id(o) for o in diverse_middle)
+                ordered_middle = [o for o in middle_candidates if id(o) in middle_set]
+
+                selected = head + ordered_middle + tail
+
+            # Join with semantic separator
+            obs_text = " | ".join(selected)
+            base = f"{header}{obs_text}{rel_text}"
+
+        return base
 
 
 # ------------------------------------------------------------------

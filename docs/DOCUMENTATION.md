@@ -85,15 +85,16 @@ Python >= 3.12
 
 ### Modelo de embeddings
 
-El motor semántico usa **paraphrase-multilingual-MiniLM-L12-v2** de Sentence Transformers:
+El motor semántico usa **intfloat/multilingual-e5-small** (modelo de retrieval asimétrico entrenado por Intel):
 
-- **Dimensiones**: 384 (float32)
-- **Idiomas**: 50+ (incluyendo español, inglés, francés, alemán, chino, japonés)
+- **Dimensiones**: 384 (float32, ONNX FP32)
+- **Idiomas**: 94+ (incluyendo español, inglés, francés, alemán, chino, japonés)
 - **Runtime**: CPU puro (no requiere GPU)
-- **Tamaño**: ~120 MB (modelo ONNX + tokenizer)
+- **Tamaño**: ~465 MB (modelo ONNX + tokenizer)
 - **Cache**: `~/.cache/mcp-memory-v2/models/`
+- **Prefixes**: `"query: "` para consultas, `"passage: "` para entidades y documentos (requisito del modelo e5)
 
-El pipeline de encoding: tokenización → forward ONNX → mean pooling (masking de PAD) → normalización L2. Los vectores resultantes se serializan a raw bytes para almacenarlos en sqlite-vec.
+El pipeline de encoding: prepend prefix → tokenización → forward ONNX → mean pooling (masking de PAD) → normalización L2. Los vectores resultantes se serializan a raw bytes para almacenarlos en sqlite-vec.
 
 ---
 
@@ -355,13 +356,13 @@ Texto de entrada
 └──────────────┘
 ```
 
-**Formateo de entidades**: Antes de codificar, las entidades se transforman a texto plano:
+**Formateo de entidades**: Antes de codificar, las entidades se transforman a texto plano usando Head+Tail+Diversity (budget 480 tokens):
 
 ```
-"{name} ({entity_type}): {obs1}. {obs2}. ..."
+"{name} ({entity_type}) | {obs1} | {obs2} | ... | Rel: tipo → destino; ..."
 ```
 
-Este formato permite que el embedding capture tanto el nombre como el tipo y el contenido semántico de las observaciones.
+Este formato permite que el embedding capture el nombre, tipo, observaciones clave y contexto relacional, respetando el límite de 480 tokens del modelo e5-small.
 
 ---
 
@@ -402,7 +403,7 @@ Esto descarga los siguientes archivos a `~/.cache/mcp-memory-v2/models/`:
 | `tokenizer_config.json` | Raíz |
 | `special_tokens_map.json` | Raíz |
 
-**Fuente del modelo**: [sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
+**Fuente del modelo**: [intfloat/multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small)
 
 > **Nota:** Esta descarga es opcional. El servidor arranca sin el modelo (ver [Lazy loading del modelo](#nota-sobre-el-modelo-de-embeddings)).
 
@@ -1379,20 +1380,21 @@ La pila técnica es:
 | Componente | Tecnología | Rol |
 |---|---|---|
 | Modelo de inferencia | ONNX Runtime (CPU) | Codifica texto → vector |
-| Modelo de lenguaje | paraphrase-multilingual-MiniLM-L12-v2 | Sentence embeddings multilingüe |
+| Modelo de lenguaje | intfloat/multilingual-e5-small | Sentence embeddings multilingüe (retrieval asimétrico) |
 | Tokenización | HuggingFace Tokenizers (Rust) | Tokenización rápida con padding/truncation |
 | Almacenamiento | sqlite-vec (vec0) | Búsqueda KNN con cosine distance |
 | Álgebra | NumPy float32 | Operaciones vectoriales |
 
 ### Modelo
 
-El modelo base es **`paraphrase-multilingual-MiniLM-L12-v2`** de la familia [sentence-transformers](https://www.sbert.net/):
+El modelo base es **`intfloat/multilingual-e5-small`** de [IntFloat](https://huggingface.co/intfloat) (familia E5):
 
-- **Dimensionalidad**: 384 floats (float32)
-- **Idiomas**: 50+ (multilingüe) — funciona nativamente con consultas en español, inglés y otros idiomas
+- **Dimensionalidad**: 384 floats (float32, ONNX FP32)
+- **Idiomas**: 94+ (multilingüe) — funciona nativamente con consultas en español, inglés y otros idiomas
 - **Optimización**: diseñado para inferencia en CPU; no requiere GPU
-- **Tamaño ONNX**: ~120 MB (modelo exportado)
+- **Tamaño ONNX**: ~465 MB (modelo exportado)
 - **Distancia**: cosine similarity (los vectores se normalizan L2)
+- **Tipo**: retrieval asimétrico — requiere prefijos `"query: "` y `"passage: "` según la tarea
 
 El modelo se exporta a ONNX y se almacena localmente junto con los archivos del tokenizer. La exportación se realiza una vez mediante el script `scripts/download_model.py`.
 
@@ -1430,6 +1432,18 @@ Texto de entrada
 ### Pipeline de Encoding
 
 La clase `EmbeddingEngine.encode()` implementa el pipeline en cinco pasos:
+
+```python
+def encode(self, texts: list[str], task: str = "passage") -> np.ndarray:
+    """Encode texts to embeddings.
+    task: "query" prepends "query: " prefix, "passage" prepends "passage: ".
+    """
+    prefix = self.QUERY_PREFIX if task == "query" else self.PASSAGE_PREFIX
+    prefixed = [f"{prefix}{t}" for t in texts]
+    # ... tokenization → ONNX → mean pooling → L2 normalize
+```
+
+Los prefijos `"query: "` y `"passage: "` son un **requisito del modelo e5** para retrieval asimétrico. Las consultas de `search_semantic` usan `task="query"`, mientras que las entidades se codifican con `task="passage"` (default).
 
 #### Paso 1 — Tokenización
 
@@ -1497,30 +1511,41 @@ La normalización L2 convierte cada vector en un *unit vector* (norma = 1). Esto
 
 ### Formato de Texto
 
-Antes de codificar una entidad, se construye un texto representativo:
+Antes de codificar una entidad, se construye un texto representativo usando la estrategia **Head+Tail+Diversity** con un budget de 480 tokens:
 
 ```python
+MAX_TOKENS = 480
+
 @staticmethod
 def prepare_entity_text(
     name: str,
     entity_type: str,
     observations: list[str],
+    relations: list[str] | None = None,
 ) -> str:
-    obs_text = ". ".join(observations)
-    return f"{name} ({entity_type}): {obs_text}"
+    # Head: primeras observaciones (si caben)
+    # Tail: últimas observaciones (si no caben en head)
+    # Diversity: observaciones intermedias seleccionadas para maximizar variedad
+    # Separator: " | " entre observaciones
+    # Relations: "Rel: type → target; ..." appended si existen
 ```
 
-Formato: `"{name} ({entity_type}): {obs1}. {obs2}. ..."`
+Formato: `"{name} ({entity_type}) | {obs1} | {obs2} | ... | Rel: tipo → destino; ..."`
 
 Ejemplo:
 
 ```
-MCP Memory v2 (Tarea): 8 tareas secuenciadas: T1 Scaffold → T2 Models → T3 Storage.
-Petición de skill: dom-fastmcp.
-Pipeline: Arquitecto → Constructor → Auditor.
+MCP Memory v2 (Tarea) | 8 tareas secuenciadas: T1 → T2 → T3 | Pipeline: Arquitecto → Constructor → Auditor | Rel: usa → FastMCP; usa → SQLite; Rel: contiene → scoring.py
 ```
 
-**Punto clave**: el texto se genera con un *snapshot completo* de todas las observaciones. Cada vez que las observaciones de una entidad cambian, el embedding se **regenera completamente** — no es incremental.
+**Estrategia Head+Tail+Diversity**:
+- **Head**: primeras observaciones (contenido más importante/estable)
+- **Tail**: últimas observaciones (contenido más reciente)
+- **Diversity**: observaciones intermedias seleccionadas para maximizar variedad semántica
+- **Budget**: 480 tokens máximo (MAX_TOKENS=480), con `" | "` como separador
+- **Relaciones**: contexto de relaciones se agrega al final con formato `"Rel: type → target; ..."` cuando existen
+
+**Punto clave**: el texto se genera con un *snapshot seleccionado* de las observaciones (no necesariamente todas). Cada vez que las observaciones de una entidad cambian, el embedding se **regenera completamente** — no es incremental.
 
 ### Almacenamiento y Serialización
 
@@ -1580,7 +1605,7 @@ Si los archivos del modelo (`model.onnx` + `tokenizer.json`) no están presentes
 
 ```
 ~/.cache/mcp-memory-v2/models/
-├── model.onnx                # Modelo ONNX exportado (~120 MB)
+├── model.onnx                # Modelo ONNX exportado (~465 MB)
 ├── tokenizer.json            # HuggingFace fast tokenizer
 ├── tokenizer_config.json     # Configuración del tokenizer
 └── special_tokens_map.json   # Mapeo de tokens especiales
@@ -1592,7 +1617,7 @@ Si los archivos del modelo (`model.onnx` + `tokenizer.json`) no están presentes
 query (texto libre)
   │
   ▼
-engine.encode([query])          → float32[384] (L2-normalizado)
+engine.encode([query], task="query") → float32[384] (L2-normalizado)
   │
   ▼
 serialize_f32(vector)           → 1536 bytes
@@ -1604,7 +1629,7 @@ sqlite-vec: WHERE embedding MATCH ? ORDER BY distance LIMIT N
 [entity_id, distance] pairs     → get_entity_by_id() + get_observations()
   │
   ▼
-resultado: [{name, entityType, observations, distance}, ...]
+resultado: [{name, entityType, observations, distance, limbic_score, scoring}, ...]
 ```
 
 Los resultados se ordenan por distancia ascendente (los más similares primero). La distancia es cosine distance (0 = idéntico). El límite por defecto es 10, configurable vía el parámetro `limit`.
@@ -1615,9 +1640,9 @@ Los resultados se ordenan por distancia ascendente (los más similares primero).
 
 ### Qué es
 
-El Sistema Límbico es una capa de scoring dinámico que se ejecuta **sobre los resultados KNN** de `search_semantic`, mejorando el ranking sin cambiar la API externa. El nombre viene de la metáfora biológica: así como el sistema límbico del cerebro asigna valencia emocional, facilita el olvido y fortalece asociaciones, este sistema asigna importancia (salience), aplica decaimiento temporal y detecta co-ocurrencias entre entidades.
+El Sistema Límbico es una capa de scoring dinámico que se ejecuta **sobre los resultados KNN** de `search_semantic`, mejorando el ranking y exponiendo métricas de scoring. El nombre viene de la metáfora biológica: así como el sistema límbico del cerebro asigna valencia emocional, facilita el olvido y fortalece asociaciones, este sistema asigna importancia (salience), aplica decaimiento temporal y detecta co-ocurrencias entre entidades.
 
-La API de `search_semantic` **no cambia** — devuelve el mismo formato `{name, entityType, observations, distance}`. La diferencia es que el orden de los resultados ya no es puramente por distancia coseno, sino por un *limbic score* compuesto que integra múltiples señales.
+La API de `search_semantic` extiende el formato de salida para incluir scoring límbico. Además del formato original `{name, entityType, observations, distance}`, cada resultado ahora incluye `limbic_score` (score compuesto) y `scoring` (desglose de componentes).
 
 ### Las 3 capacidades
 
@@ -1653,12 +1678,13 @@ Combina dos señales:
 #### Sub-fórmula: temporal_factor(e)
 
 ```
-temporal_factor(e) = exp(-λ × Δt_hours)
+temporal_factor(e) = max(TEMPORAL_FLOOR, exp(-LAMBDA_HOURLY × Δt_hours))
 ```
 
 - `Δt_hours` = horas desde el último acceso (o desde `created_at` si nunca se accedió)
-- `λ = 0.001` → half-life ≈ 29 días
-- Una entidad accedida hace 1 hora: factor ≈ 0.999. Hace 30 días: factor ≈ 0.49
+- `LAMBDA_HOURLY = 0.0001` → half-life ≈ 290 días (`ln(2)/0.0001 ≈ 6931 horas`)
+- `TEMPORAL_FLOOR = 0.1` → el decaimiento nunca baja de 0.1 (el conocimiento se degrada pero no se destruye)
+- Una entidad accedida hace 1 hora: factor ≈ 0.9999. Hace 30 días: factor ≈ 0.928. Hace 1 año: factor ≈ 0.407
 
 #### Sub-fórmula: cooc_boost(e, R)
 
@@ -1675,9 +1701,10 @@ Suma logarítmica de co-ocurrencias entre la entidad `e` y cada otra entidad `r`
 | `BETA_SAL` | `0.5` | Peso del boost por salience (importance). Un valor de 0.5 significa que una entidad con importance=1.0 recibe un boost de 1.5× sobre la similitud pura |
 | `BETA_DEG` | `0.15` | Peso del degree dentro de la fórmula de importance. Bajo a propósito — el grado es una señal secundaria |
 | `D_MAX` | `15` | Cap de relaciones para normalizar degree. Entidades con >15 relaciones no reciben boost adicional |
-| `LAMBDA_HOURLY` | `0.001` | Tasa de decaimiento temporal por hora. Half-life ≈ 29 días (`ln(2)/0.001 ≈ 693 horas`) |
+| `LAMBDA_HOURLY` | `0.0001` | Tasa de decaimiento temporal por hora. Half-life ≈ 290 días (`ln(2)/0.0001 ≈ 6931 horas`) |
 | `GAMMA` | `0.1` | Peso del co-occurrence boost. Un valor de 0.1 significa que 5 co-ocurrencias con log₂ suman ~0.24× de boost |
 | `EXPANSION_FACTOR` | `3` | Factor de sobre-recuperación KNN. Si `limit=10`, se recuperan 30 candidatos para re-ranking |
+| `TEMPORAL_FLOOR` | `0.1` | Piso mínimo del decaimiento temporal. El conocimiento se degrada pero nunca cae por debajo de este valor |
 
 ### Schema: tablas nuevas
 
@@ -1702,12 +1729,12 @@ CREATE TABLE co_occurrences (
 ### Flujo completo: encode → re-rank → track
 
 ```
-1. Encode query     → engine.encode([query]) → float[384]
+1. Encode query     → engine.encode([query], task="query") → float[384]
 2. KNN 3×           → search_embeddings(query, limit × 3) → [{entity_id, distance}]
 3. Fetch metadata   → get_access_data(), get_entity_degrees(), get_co_occurrences()
 4. Re-rank          → rank_candidates() → compute limbic_score per candidate → sort → top-K
-5. Build output     → same {name, entityType, observations, distance} format
-6. Record signals   → record_access(top-K ids) + record_co_occurrences(top-K ids)
+5. Build output     → {name, entityType, observations, distance, limbic_score, scoring}
+6. Record signals   → record_access(top-K ids) + record_co_occurrences(top-K ids) (search + open_nodes)
 ```
 
 El paso 6 (grabación de señales) ocurre después de construir la respuesta, es *best-effort*, y no afecta el resultado retornado.
@@ -1727,14 +1754,31 @@ Las constantes están a nivel de módulo y son directamente editables.
 
 ### Transparencia de API
 
-El Sistema Límbico es completamente transparente para el cliente:
+El Sistema Límbico extiende la API de `search_semantic` de forma backward-compatible:
 
 - **Formato de entrada**: `search_semantic(query, limit)` — sin cambios
-- **Formato de salida**: `{results: [{name, entityType, observations, distance}]}` — sin cambios
+- **Formato de salida**: cada resultado incluye campos nuevos además de los originales:
+  ```json
+  {
+    "results": [{
+      "name": "...",
+      "entityType": "...",
+      "observations": ["..."],
+      "distance": 0.42,
+      "limbic_score": 0.67,
+      "scoring": {
+        "importance": 0.85,
+        "temporal_factor": 0.99,
+        "cooc_boost": 1.23
+      }
+    }]
+  }
+  ```
 - **Campo `distance`**: sigue siendo la distancia coseno original del KNN (no el limbic score)
-- **Orden**: ahora por limbic score descendente en vez de distancia coseno ascendente
-
-El limbic score es un valor interno que no se expone en la respuesta.
+- **Campo `limbic_score`**: score compuesto que determina el orden de los resultados
+- **Campo `scoring`**: desglose de los tres componentes del limbic score
+- **Orden**: por limbic score descendente en vez de distancia coseno ascendente
+- **Co-occurrence tracking**: se registra tanto en `search_semantic` como en `open_nodes` (cuando se abren 2+ entidades juntos)
 
 ---
 
