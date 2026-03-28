@@ -1,6 +1,6 @@
 # mcp-memory
 
-A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) — with SQLite persistence, vector embeddings, and semantic search.
+A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) — with SQLite persistence, vector embeddings, semantic search, and **🧠 Limbic Scoring** for dynamic ranking.
 
 **Why?** The original server writes the entire knowledge graph to a JSONL file on every operation, with no locking or atomic writes. Under concurrent access (multiple MCP clients), this causes data corruption. This server replaces that with a proper SQLite database.
 
@@ -9,6 +9,7 @@ A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com
 - **Drop-in compatible** with Anthropic's 9 MCP tools (same API, same behavior)
 - **SQLite + WAL** — safe concurrent access, no more corrupted JSONL
 - **Semantic search** via sqlite-vec + ONNX embeddings (50+ languages)
+- **🧠 Limbic Scoring** — dynamic re-ranking with salience, temporal decay, and co-occurrence signals. Entities that are frequently accessed, recently used, or co-occur together rank higher — transparent to the API.
 - **Lightweight** — ~150 MB total vs ~1.4 GB for similar solutions
 - **Migration** — one-click import from Anthropic's JSONL format
 - **Zero config** — works out of the box, optional model download for semantic search
@@ -83,7 +84,7 @@ print(result)
 
 | Tool | Description |
 |------|-------------|
-| `search_semantic` | Semantic search via vector embeddings (cosine similarity) |
+| `search_semantic` | Semantic search via vector embeddings (cosine similarity) with **Limbic Scoring** re-ranking |
 | `migrate` | Import from Anthropic's JSONL format (idempotent) |
 
 ## Architecture
@@ -95,10 +96,14 @@ server.py (FastMCP)  ←→  storage.py (SQLite + sqlite-vec)
                               ↑
                         paraphrase-multilingual-MiniLM-L12-v2
                         (384d, 50+ languages, CPU-only)
+                              ↑
+                        scoring.py (Limbic Scoring)
+                        salience · temporal decay · co-occurrence
 ```
 
 - **Storage**: SQLite with WAL journaling, 5-second busy timeout, CASCADE deletes
 - **Embeddings**: Singleton ONNX model loaded once at startup, L2-normalized cosine search
+- **Limbic Scoring**: Re-ranks KNN candidates using importance signals, temporal decay, and co-occurrence patterns — transparent to the API
 - **Concurrency**: SQLite handles locking internally — no fcntl, no fs wars
 
 ## How It Works
@@ -109,7 +114,15 @@ Each entity gets an embedding vector generated from its concatenated content:
 "{name} ({entity_type}): {observation_1}. {observation_2}. ..."
 ```
 
-When you call `search_semantic`, the query is encoded with the same model and compared against all entity vectors using k-nearest neighbors (cosine distance) via `sqlite-vec`.
+When you call `search_semantic`, the query is encoded with the same model and compared against all entity vectors using k-nearest neighbors (cosine distance) via `sqlite-vec`. Results are then re-ranked by the Limbic Scoring engine, which considers:
+
+- **Salience** — frequently accessed and well-connected entities rank higher
+- **Temporal decay** — recently used entities stay fresh; untouched entities fade
+- **Co-occurrence** — entities that appear together often reinforce each other
+
+The API output format is unchanged — the limbic scoring operates transparently under the hood.
+
+> **For full technical details**, see [DOCUMENTATION.md](docs/DOCUMENTATION.md) — includes the scoring formula, constant values, schema DDL, and architecture diagrams.
 
 ## Requirements
 

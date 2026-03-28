@@ -87,6 +87,9 @@ def create_entities(entities: list[dict[str, Any]]) -> dict[str, Any]:
             # Recompute embedding
             _recompute_embedding(entity_id, parsed.name, parsed.entityType, all_obs)
 
+            # Limbic: initialize access tracking for new/updated entity
+            store.init_access(entity_id)
+
             results.append(
                 {
                     "name": parsed.name,
@@ -172,6 +175,9 @@ def add_observations(name: str, observations: list[str]) -> dict[str, Any]:
         _recompute_embedding(
             entity["id"], entity["name"], entity["entity_type"], all_obs
         )
+
+        # Limbic: record access on observation add
+        store.record_access(entity["id"])
 
         return {
             "entity": {
@@ -317,6 +323,8 @@ def open_nodes(names: list[str]) -> dict[str, Any]:
             entity = store.get_entity_by_name(name)
             if entity:
                 obs = store.get_observations(entity["id"])
+                # Limbic: record access on node open
+                store.record_access(entity["id"])
                 results.append(_entity_to_output(entity, obs))
         return {"entities": results}
     except Exception as e:
@@ -350,34 +358,72 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             }
 
         from mcp_memory.embeddings import serialize_f32
+        from mcp_memory.scoring import EXPANSION_FACTOR, rank_candidates
 
         # Encode query
         query_vector = engine.encode([query])
         query_bytes = serialize_f32(query_vector[0])
 
-        # KNN search
-        results = store.search_embeddings(query_bytes, limit=limit)
+        # KNN search with expansion factor (over-retrieve candidates)
+        expanded_limit = limit * EXPANSION_FACTOR
+        knn_results = store.search_embeddings(query_bytes, limit=expanded_limit)
 
-        # Build output
+        if not knn_results:
+            return {"results": []}
+
+        # Collect candidate IDs
+        candidate_ids = [r["entity_id"] for r in knn_results]
+
+        # Fetch limbic signals for all candidates
+        access_data = store.get_access_data(candidate_ids)
+        degree_data = store.get_entity_degrees(candidate_ids)
+        cooc_data = store.get_co_occurrences(candidate_ids)
+
+        # Fetch created_at for temporal factor
+        entity_created: dict[int, str] = {}
+        for eid in candidate_ids:
+            row = store.get_entity_by_id(eid)
+            if row:
+                entity_created[eid] = row["created_at"]
+
+        # Re-rank with limbic scoring (Opción B)
+        ranked = rank_candidates(
+            knn_results=knn_results,
+            access_data=access_data,
+            degree_data=degree_data,
+            cooc_data=cooc_data,
+            entity_created=entity_created,
+            limit=limit,
+        )
+
+        # Build output (same format as before)
         output = []
-        for item in results:
-            entity_id = item["entity_id"]
-            distance = item["distance"]
-
-            # Get entity data
-            row = store.get_entity_by_id(entity_id)
+        top_k_ids = []
+        for item in ranked:
+            eid = item["entity_id"]
+            row = store.get_entity_by_id(eid)
             if not row:
                 continue
 
-            obs = store.get_observations(entity_id)
+            obs = store.get_observations(eid)
             output.append(
                 {
                     "name": row["name"],
                     "entityType": row["entity_type"],
                     "observations": obs,
-                    "distance": round(distance, 4),
+                    "distance": round(item["distance"], 4),
                 }
             )
+            top_k_ids.append(eid)
+
+        # Limbic: record access + co-occurrences for top-K (post-response, best-effort)
+        try:
+            for eid in top_k_ids:
+                store.record_access(eid)
+            if len(top_k_ids) >= 2:
+                store.record_co_occurrences(top_k_ids)
+        except Exception as e:
+            logger.warning("Limbic tracking failed: %s", e)
 
         return {"results": output}
 
@@ -390,10 +436,15 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
 # ============================================================
 @mcp.tool
 def migrate(
-    source_path: str = "/home/cachorro/.config/opencode/mcp-memory.jsonl",
+    source_path: str = "",
 ) -> dict[str, Any]:
     """Migrate data from Anthropic MCP Memory JSONL format to SQLite.
-    This is idempotent — running it multiple times won't duplicate data."""
+    This is idempotent — running it multiple times won't duplicate data.
+    Requires a valid source_path to an existing JSONL file."""
+    if not source_path:
+        return {
+            "error": "source_path is required — provide the path to an Anthropic MCP Memory JSONL file"
+        }
     try:
         from mcp_memory.migrate import migrate_jsonl
 
