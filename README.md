@@ -8,9 +8,10 @@ A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com
 
 - **Drop-in compatible** with Anthropic's 9 MCP tools (same API, same behavior)
 - **SQLite + WAL** — safe concurrent access, no more corrupted JSONL
-- **Semantic search** via sqlite-vec + ONNX embeddings (50+ languages)
-- **🧠 Limbic Scoring** — dynamic re-ranking with salience, temporal decay, and co-occurrence signals. Entities that are frequently accessed, recently used, or co-occur together rank higher — transparent to the API.
-- **Lightweight** — ~150 MB total vs ~1.4 GB for similar solutions
+- **Semantic search** via sqlite-vec + ONNX embeddings (94+ languages)
+- **Hybrid search** (FTS5 + KNN) — combines full-text BM25 and semantic vector search via Reciprocal Rank Fusion. Finds entities by exact terms or semantic similarity — or both at once.
+- **🧠 Limbic Scoring** — dynamic re-ranking with salience, temporal decay, co-occurrence signals, and hybrid search scores. Transparent to the API.
+- **Lightweight** — ~500 MB total vs ~1.4 GB for similar solutions
 - **Migration** — one-click import from Anthropic's JSONL format
 - **Zero config** — works out of the box, optional model download for semantic search
 
@@ -47,7 +48,7 @@ cd /path/to/mcp-memory
 uv run python scripts/download_model.py
 ```
 
-This downloads a multilingual sentence model (~80 MB) to `~/.cache/mcp-memory-v2/models/`. Without it, all tools work fine — only `search_semantic` will be unavailable.
+This downloads a multilingual sentence model (~465 MB) to `~/.cache/mcp-memory-v2/models/`. Without it, all tools work fine — only `search_semantic` will be unavailable.
 
 ### 3. Migrate existing data (optional)
 
@@ -90,39 +91,45 @@ print(result)
 ## Architecture
 
 ```
-server.py (FastMCP)  ←→  storage.py (SQLite + sqlite-vec)
+server.py (FastMCP)  ←→  storage.py (SQLite + sqlite-vec + FTS5)
                               ↑
                         embeddings.py (ONNX Runtime)
                               ↑
-                        paraphrase-multilingual-MiniLM-L12-v2
-                        (384d, 50+ languages, CPU-only)
+                        intfloat/multilingual-e5-small
+                        (384d, 94+ languages, asymmetric retrieval)
                               ↑
-                        scoring.py (Limbic Scoring)
+                        scoring.py (Limbic Scoring + RRF)
                         salience · temporal decay · co-occurrence
 ```
 
 - **Storage**: SQLite with WAL journaling, 5-second busy timeout, CASCADE deletes
 - **Embeddings**: Singleton ONNX model loaded once at startup, L2-normalized cosine search
-- **Limbic Scoring**: Re-ranks KNN candidates using importance signals, temporal decay, and co-occurrence patterns — transparent to the API
+- **Limbic Scoring**: Re-ranks hybrid (KNN + FTS5) candidates using importance signals, temporal decay, co-occurrence patterns, and RRF scores — transparent to the API
 - **Concurrency**: SQLite handles locking internally — no fcntl, no fs wars
 
 ## How It Works
 
-Each entity gets an embedding vector generated from its concatenated content:
+Each entity gets an embedding vector generated from its text using a **Head+Tail+Diversity** selection strategy (budget: 480 tokens):
 
 ```
-"{name} ({entity_type}): {observation_1}. {observation_2}. ..."
+"{name} ({entity_type}) | {obs1} | {obs2} | ... | Rel: type → target; ..."
 ```
 
-When you call `search_semantic`, the query is encoded with the same model and compared against all entity vectors using k-nearest neighbors (cosine distance) via `sqlite-vec`. Results are then re-ranked by the Limbic Scoring engine, which considers:
+When you call `search_semantic`, the pipeline runs in parallel:
+
+1. **Semantic (KNN)** — the query is encoded with the `"query: "` prefix and compared against entity vectors via `sqlite-vec`
+2. **Full-text (FTS5)** — the query is searched against a BM25 index covering names, types, and observation content
+3. **Merge (RRF)** — results from both branches are combined using Reciprocal Rank Fusion (`score(d) = Σ 1/(k + rank)`)
+
+The merged candidates are then re-ranked by the **Limbic Scoring** engine, which considers:
 
 - **Salience** — frequently accessed and well-connected entities rank higher
 - **Temporal decay** — recently used entities stay fresh; untouched entities fade
 - **Co-occurrence** — entities that appear together often reinforce each other
 
-The API output format is unchanged — the limbic scoring operates transparently under the hood.
+The output includes `limbic_score`, `scoring` (importance/temporal/cooc breakdown), and optionally `rrf_score` when FTS5 contributes results.
 
-> **For full technical details**, see [DOCUMENTATION.md](docs/DOCUMENTATION.md) — includes the scoring formula, constant values, schema DDL, and architecture diagrams.
+> **For full technical details**, see [DOCUMENTATION.md](docs/DOCUMENTATION.md) — includes the scoring formula, RRF constants, schema DDL, and architecture diagrams.
 
 ## Requirements
 

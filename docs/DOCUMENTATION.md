@@ -69,7 +69,7 @@ Las dos tools nuevas extienden la funcionalidad sin romper la API existente:
 
 ```
 Python >= 3.12
-├── FastMCP >= 2.0          # Framework MCP (servidor + registro de tools)
+├── FastMCP >= 3.0          # Framework MCP (servidor + registro de tools)
 ├── SQLite (stdlib)         # Base de datos persistente
 │   └── WAL mode            # Escritura concurrente sin bloqueos
 ├── sqlite-vec >= 0.1.6     # Extensión vectorial para KNN
@@ -192,7 +192,7 @@ El embedding se recalcula cada vez que cambia el contenido de una entidad (creac
 
 ### Flujo de datos: búsqueda semántica
 
-La búsqueda semántica usa KNN sobre los vectores almacenados en sqlite-vec, seguido de un re-ranking con el Sistema Límbico:
+La búsqueda semántica usa KNN sobre los vectores almacenados en sqlite-vec, combinado con FTS5 para búsqueda de texto completo, seguido de fusión RRF y re-ranking con el Sistema Límbico:
 
 ```
 ┌──────────┐
@@ -209,39 +209,45 @@ La búsqueda semántica usa KNN sobre los vectores almacenados en sqlite-vec, se
 └────┬─────┘
      │ query string
      ▼
-┌──────────┐
-│ Embedding│  encode(["memoria del proyecto"])
-│  Engine  │  → float[384] L2-normalised
-│  (ONNX)  │
-└────┬─────┘
-     │ serialize_f32() → bytes
-     ▼
-┌──────────┐
-│ sqlite-  │  SELECT rowid, distance
-│  vec     │  FROM entity_embeddings
-│ (KNN)    │  WHERE embedding MATCH ?
-│          │  ORDER BY distance LIMIT 10×3
-│          │  (over-retrieve by EXPANSION_FACTOR)
-└────┬─────┘
-     │ [{entity_id, distance}, ...] × 3×
+┌──────────────────────────────┐
+│         Parallel Search      │
+│  ┌──────────┐ ┌───────────┐ │
+│  │ KNN      │ │ FTS5      │ │
+│  │ encode   │ │ BM25 on   │ │
+│  │ (query:) │ │ name/type │ │
+│  │ → 3×lim  │ │ /obs_text │ │
+│  └────┬─────┘ └─────┬─────┘ │
+└───────┼──────────────┼───────┘
+        │ [{id,dist}]  │ [{id,rank}]
+        └──────┬───────┘
+               │
+               ▼
+┌──────────────────┐
+│  RRF Merge       │  Si FTS5 tiene resultados:
+│  score = Σ 1/    │    reciprocal_rank_fusion()
+│  (k + rank)      │  Si no: pure semantic
+└────┬─────────────┘
+     │ [{id, rrf_score, dist|None}]
      ▼
 ┌──────────┐
 │ scoring  │  Fetch limbic signals:
 │   .py    │    access_data, degree_data,
 │ (Limbic) │    cooc_data, created_at
-│          │  Compute limbic_score for each
-│          │  candidate → re-rank → top-K
+│          │  rank_hybrid_candidates()
+│          │  o rank_candidates() (fallback)
 └────┬─────┘
-     │ [{entity_id, distance, limbic_score}]
+     │ [{id, dist, rrf?, limbic_score}]
      ▼
 ┌──────────┐
 │  Memory  │  Por cada resultado:
-│  Store   │    get_entity_by_id(entity_id)
-│          │    + get_observations(entity_id)
+│  Store   │    get_entity_by_id()
+│          │    + get_observations()
 │          │  + record_access() (post-response)
 │          │  + record_co_occurrences()
 └────┬─────┘
-     │ [{name, entityType, obs, distance}]
+     │ [{name, entityType, obs,
+     │    limbic_score, scoring,
+     │    distance?, rrf_score?}]
      ▼
 ┌──────────┐
 │  Client   │  Respuesta con entidades
@@ -275,6 +281,7 @@ PRAGMA foreign_keys  = ON       # Integridad referencial
 | `relations` | Aristas del grafo (from_entity, to_entity, relation_type) |
 | `db_metadata` | Metadatos clave-valor del sistema |
 | `entity_embeddings` (vec0) | Tabla virtual sqlite-vec para vectores float[384] |
+| `entity_fts` (FTS5) | Tabla virtual para búsqueda de texto completo (BM25) sobre nombres, tipos y observaciones |
 
 **Índices**: Se crean índices sobre `observations(entity_id)`, `relations(from_entity)`, `relations(to_entity)`, `relations(relation_type)`, `entities(name)` y `entities(entity_type)`.
 
@@ -474,7 +481,7 @@ Comportamiento según disponibilidad del modelo:
 
 | Paquete | Versión mínima | Propósito |
 |---------|---------------|-----------|
-| `fastmcp` | >= 2.0 | Framework MCP para registro de tools y transporte stdio |
+| `fastmcp` | >= 3.0 | Framework MCP para registro de tools y transporte stdio |
 | `pydantic` | >= 2.0 | Validación de modelos de entrada/salida (entities, relations) |
 | `numpy` | >= 1.26 | Operaciones numéricas y manipulación de vectores de embeddings |
 | `sqlite-vec` | >= 0.1.6 | Extensión SQLite para búsqueda vectorial (KNN) |
@@ -555,6 +562,16 @@ Las entidades representan nodos del grafo. Las observaciones son hechos atados a
   │  db_metadata    │  (independiente)
   │  key (PK)       │
   │  value          │
+  └─────────────────┘
+
+  ┌─────────────────┐
+  │  entity_fts     │  (FTS5 virtual)
+  │  (VIRTUAL)      │
+  │  rowid → id     │
+  │  name           │
+  │  entity_type    │
+  │  obs_text       │
+  │  unicode61      │
   └─────────────────┘
 ```
 
@@ -652,6 +669,19 @@ Tabla de soporte para el Sistema Límbico. Registra cuántas veces dos entidades
 
 > **Nota**: La PK compuesta `(entity_a_id, entity_b_id)` garantiza orden canónico: `entity_a_id < entity_b_id` siempre. Esto evita duplicados como `(A, B)` y `(B, A)`.
 
+#### `entity_fts` (FTS5 Virtual)
+
+Tabla virtual FTS5 para búsqueda de texto completo. Indexa el nombre, tipo y observaciones de cada entidad.
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| `name` | `TEXT` | Nombre de la entidad (searchable) |
+| `entity_type` | `TEXT` | Tipo de entidad (searchable) |
+| `obs_text` | `TEXT` | Todas las observaciones concatenadas con `" | "` como separador |
+| `rowid` | `INTEGER` (implícito) | Corresponde a `entities.id` |
+
+> **Nota**: El tokenizer es `unicode61`, que soporta correctamente caracteres acentuados (é, ñ, ü) y otros Unicode. La sincronización es **code-level** (no triggers SQLite): `_sync_fts()` se invoca manualmente en `upsert_entity`, `add_observations` y `delete_observations`. En `init_db()`, si la tabla FTS está vacía pero hay entidades existentes, se ejecuta `_backfill_fts()` para poblarla.
+
 ### Índices
 
 Los siguientes índices optimizan las consultas más frecuentes:
@@ -716,6 +746,10 @@ CREATE TABLE co_occurrences (
     last_co      TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (entity_a_id, entity_b_id)
 );
+
+-- Full-text search (FTS5)
+CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
+USING fts5(name, entity_type, obs_text, tokenize="unicode61");
 
 -- Índices
 CREATE INDEX idx_entities_name  ON entities(name);
@@ -1265,7 +1299,7 @@ Con errores:
 
 #### 10. `search_semantic`
 
-**Descripción**: Semantic search using vector embeddings. Finds entities most similar to the query. Results are re-ranked with the Limbic Scoring system (salience, temporal decay, co-occurrence) for improved relevance. Requires the embedding model to be downloaded (run `download_model.py` first).
+**Descripción**: Semantic search using vector embeddings with optional full-text hybrid search. Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion, then applies limbic re-ranking based on access patterns and co-occurrence. Requires the embedding model to be downloaded (run `download_model.py` first).
 
 **Firma**: `search_semantic(query: str, limit: int = 10) → dict[str, Any]`
 
@@ -1288,7 +1322,14 @@ Con errores:
         "11 tools MCP: 9 Anthropic-compat + 2 nuevos",
         "Stack: FastMCP 3.1.1 + sqlite-vec + ONNX"
       ],
-      "distance": 0.1234
+      "limbic_score": 0.6742,
+      "scoring": {
+        "importance": 0.8512,
+        "temporal_factor": 0.9923,
+        "cooc_boost": 1.2341
+      },
+      "distance": 0.1234,
+      "rrf_score": 0.018542
     },
     {
       "name": "Skill: memoria-sofia",
@@ -1296,7 +1337,14 @@ Con errores:
       "observations": [
         "Fase 1 Diagnóstico: Equipo de Análisis"
       ],
-      "distance": 0.3591
+      "limbic_score": 0.4521,
+      "scoring": {
+        "importance": 0.6234,
+        "temporal_factor": 0.8756,
+        "cooc_boost": 0.5123
+      },
+      "distance": 0.3591,
+      "rrf_score": 0.012341
     }
   ]
 }
@@ -1312,12 +1360,13 @@ Error (modelo no disponible):
 
 **Notas**:
 - **Requiere** que el modelo ONNX esté descargado. Si no lo está, retorna un error descriptivo.
-- Usa **KNN search** con cosine distance sobre la tabla virtual `vec0` de sqlite-vec.
-- El campo `distance` es la **distancia coseno**, redondeada a 4 decimales.
-- **Menor distance = mayor similitud**. La fórmula es `d = 1 - cos(A, B)`, con rango `[0, 2]`: `0.0` = idénticos, `1.0` = ortogonales, `2.0` = opuestos.
-- El texto que se codifica para cada entidad es el **snapshot completo**: nombre + tipo + todas las observaciones.
-- **Limbic re-ranking**: after KNN retrieval, candidates are re-ranked using salience, temporal decay, and co-occurrence signals. The API output format remains identical — the `distance` field reflects the original cosine distance, while the internal ordering is driven by the composite limbic score. See [Sistema Límbico — Scoring Dinámico](#sistema-límbico--scoring-dinámico) for details.
-- **Post-response tracking**: after returning results, the tool records access events and co-occurrences for the top-K entities to improve future rankings. This is best-effort and does not affect the response.
+- Usa **búsqueda híbrida**: KNN (sqlite-vec cosine distance) **en paralelo** con FTS5 (BM25 full-text). Los resultados se fusionan vía **Reciprocal Rank Fusion** (k=60).
+- Si FTS5 no retorna resultados o no está disponible, cae a **pure semantic** (solo KNN + limbic re-ranking).
+- Cada resultado incluye `limbic_score` (ordenamiento), `scoring` (desglose importance/temporal_factor/cooc_boost), y `distance` (cosine distance del KNN).
+- El campo `rrf_score` solo aparece en modo híbrido (cuando FTS5 contribuye resultados). En modo pure semantic está ausente.
+- **Post-response tracking**: después de retornar resultados, se registran access events y co-occurrences para las entidades top-K (mejora rankings futuros). Best-effort, no afecta la respuesta.
+- **Menor distance = mayor similitud**. La fórmula es `d = 1 - cos(A, B)`, con rango `[0, 2]`.
+- El texto que se codifica para cada entidad usa la estrategia **Head+Tail+Diversity** con budget de 480 tokens (no concatenación simple).
 
 ---
 
@@ -1634,6 +1683,146 @@ resultado: [{name, entityType, observations, distance, limbic_score, scoring}, .
 
 Los resultados se ordenan por distancia ascendente (los más similares primero). La distancia es cosine distance (0 = idéntico). El límite por defecto es 10, configurable vía el parámetro `limit`.
 
+### Búsqueda Híbrida: FTS5 + RRF
+
+#### Motivación
+
+La búsqueda KNN pura por embeddings encuentra entidades semánticamente similares, pero falla cuando el usuario busca por **términos exactos** (nombres, IDs, jerga técnica). FTS5 (BM25) es excelente para matching literal pero ignora sinónimos y contexto semántico. La búsqueda híbrida combina ambas señales para obtener lo mejor de cada mundo.
+
+#### Pipeline
+
+```
+                        query (texto libre)
+                               │
+                    ┌──────────┼──────────┐
+                    │                     │
+                    ▼                     ▼
+        ┌──────────────────┐  ┌──────────────────┐
+        │  Semantic (KNN)  │  │  Full-text (FTS5)│
+        │  encode(query,   │  │  BM25 sobre      │
+        │   task="query")  │  │  name/type/obs   │
+        │  → KNN 3× limit  │  │  → top 3× limit  │
+        └────────┬─────────┘  └────────┬─────────┘
+                 │ [{entity_id,       │ [{entity_id,
+                 │   distance}]       │   rank}]
+                 │                     │
+                 └──────────┬──────────┘
+                            │
+                            ▼
+                 ┌──────────────────┐
+                 │  RRF Merge       │  score(d) = Σ 1/(k + rank_i(d))
+                 │  (k = 60)        │  Entidades en ambos rankings
+                 └────────┬─────────┘  reciben boost
+                          │
+                          ▼
+                 ┌──────────────────┐
+                 │  Limbic Re-rank  │  salience · temporal · cooc
+                 │  → top-K         │
+                 └────────┬─────────┘
+                          │
+                          ▼
+                 [{name, entityType, observations,
+                   limbic_score, scoring,
+                   distance, rrf_score}]
+```
+
+#### entity_fts Schema
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
+USING fts5(name, entity_type, obs_text, tokenize="unicode61");
+```
+
+- **Columnas indexadas**: `name`, `entity_type`, `obs_text` (observaciones concatenadas con `" | "`)
+- **Tokenizer**: `unicode61` — soporta caracteres acentuados y Unicode (español, etc.)
+- **rowid**: corresponde a `entities.id` para JOIN implícito
+
+#### Sincronización FTS
+
+La tabla FTS se mantiene sincronizada a nivel de código (no via triggers SQLite):
+
+| Operación | Método invocado | Comportamiento |
+|---|---|---|
+| `upsert_entity` | `_sync_fts(entity_id)` | INSERT OR REPLACE con datos actuales |
+| `add_observations` | `_sync_fts(entity_id)` | Re reconstruye obs_text desde DB |
+| `delete_observations` | `_sync_fts(entity_id)` | Re construye obs_text desde DB |
+| `delete_entities` | DELETE directo por rowid | Eliminación manual (FTS5 no soporta CASCADE) |
+| `init_db` (backfill) | `_backfill_fts()` | Puebla desde entidades existentes si FTS vacía |
+
+El método `_sync_fts()` lee el estado actual de la entidad desde la DB (nombre + tipo + observaciones) y ejecuta `INSERT OR REPLACE` en la tabla FTS. Es idempotente y safe.
+
+#### Reciprocal Rank Fusion (RRF)
+
+La fusión de rankings usa la fórmula estándar de RRF:
+
+```
+rrf_score(d) = Σ_{i ∈ rankings} 1 / (k + rank_i(d))
+```
+
+Donde:
+- `rank_i(d)` = posición 1-based del documento `d` en el ranking `i`
+- `k` = constante de smoothing (`RRF_K = 60`, valor del paper original)
+- Una entidad que aparece en **ambos** rankings recibe puntaje de ambos → se impulsa
+- Una entidad que aparece en **solo uno** recibe puntaje parcial
+
+Implementación en `scoring.py`:
+
+```python
+def reciprocal_rank_fusion(
+    semantic_results: list[dict],  # [{entity_id, distance}] ordered by distance
+    fts_results: list[dict],       # [{entity_id, rank}] ordered by BM25 rank
+    k: int = RRF_K,               # 60
+) -> list[dict]:
+    # Returns [{entity_id, rrf_score, distance | None}] sorted by rrf_score desc
+```
+
+#### Scoring Híbrido: rank_hybrid_candidates()
+
+Cuando la búsqueda híbrida está activa, el limbic scoring usa `rank_hybrid_candidates()` en lugar de `rank_candidates()`. La diferencia clave está en cómo se calcula la **relevancia base**:
+
+| Tipo de entidad | base_relevance | Fuente |
+|---|---|---|
+| KNN + FTS (ambos) | `max(0, 1 - distance)` | Similitud coseno del KNN |
+| KNN only | `max(0, 1 - distance)` | Similitud coseno del KNN |
+| FTS only (no KNN) | `0.2 + 0.6 × norm_rrf` | RRF normalizado a [0.2, 0.8] |
+
+Las entidades encontradas solo por FTS5 no tienen `distance` (es `None`). En lugar de eso, su RRF score se normaliza min-max al rango [0.2, 0.8] para evitar que dominen o queden en el piso:
+
+```python
+norm_rrf = (rrf_score - rrf_min) / rrf_range
+base_relevance = 0.2 + 0.6 * norm_rrf  # → [0.2, 0.8]
+```
+
+La fórmula compuesta es la misma del Sistema Límbico:
+
+```
+limbic_score = base_relevance × (1 + β_sal × importance) × temporal × (1 + γ × cooc_boost)
+```
+
+#### Comportamiento Fallback
+
+Si FTS5 no está disponible (extensión no cargada) o no retorna resultados, el pipeline cae automáticamente a **pure semantic**: usa `rank_candidates()` con los resultados KNN directamente, sin RRF.
+
+#### Output
+
+En modo híbrido, la respuesta de `search_semantic` incluye un campo adicional `rrf_score` para cada resultado:
+
+```json
+{
+  "results": [{
+    "name": "...",
+    "entityType": "...",
+    "observations": ["..."],
+    "limbic_score": 0.67,
+    "scoring": {"importance": 0.85, "temporal_factor": 0.99, "cooc_boost": 1.23},
+    "distance": 0.42,
+    "rrf_score": 0.018542
+  }]
+}
+```
+
+En modo pure semantic, `rrf_score` está ausente.
+
 ---
 
 ## Sistema Límbico — Scoring Dinámico
@@ -1702,7 +1891,8 @@ Suma logarítmica de co-ocurrencias entre la entidad `e` y cada otra entidad `r`
 | `BETA_DEG` | `0.15` | Peso del degree dentro de la fórmula de importance. Bajo a propósito — el grado es una señal secundaria |
 | `D_MAX` | `15` | Cap de relaciones para normalizar degree. Entidades con >15 relaciones no reciben boost adicional |
 | `LAMBDA_HOURLY` | `0.0001` | Tasa de decaimiento temporal por hora. Half-life ≈ 290 días (`ln(2)/0.0001 ≈ 6931 horas`) |
-| `GAMMA` | `0.1` | Peso del co-occurrence boost. Un valor de 0.1 significa que 5 co-ocurrencias con log₂ suman ~0.24× de boost |
+| `GAMMA` | `0.01` | Peso del co-occurrence boost (reducido de 0.1 — γ=0.1 dominaba scoring 24×). Un valor de 0.01 equilibra los 3 componentes del scoring |
+| `RRF_K` | `60` | Constante de smoothing para Reciprocal Rank Fusion (valor estándar del paper original). Higher = menos peso en la posición del ranking |
 | `EXPANSION_FACTOR` | `3` | Factor de sobre-recuperación KNN. Si `limit=10`, se recuperan 30 candidatos para re-ranking |
 | `TEMPORAL_FLOOR` | `0.1` | Piso mínimo del decaimiento temporal. El conocimiento se degrada pero nunca cae por debajo de este valor |
 
@@ -1741,11 +1931,13 @@ El paso 6 (grabación de señales) ocurre después de construir la respuesta, es
 
 ### Módulo: scoring.py
 
-El motor de scoring vive en `src/mcp_memory/scoring.py` (~179 líneas). Expone:
+El motor de scoring vive en `src/mcp_memory/scoring.py` (~351 líneas). Expone:
 
 | Función | Propósito |
 |---|---|
-| `rank_candidates()` | Entry point principal — recibe resultados KNN + metadata, retorna top-K re-rankeados |
+| `rank_candidates()` | Re-rank KNN results + limbic scoring — modo pure semantic |
+| `rank_hybrid_candidates()` | Re-rank RRF-merged results + limbic scoring — modo híbrido |
+| `reciprocal_rank_fusion()` | Fusiona rankings KNN y FTS5 usando RRF (k=60) |
 | `compute_importance()` | Calcula importance(e) a partir de access_count, max_access y degree |
 | `compute_temporal_factor()` | Calcula temporal_factor(e) a partir de last_access / created_at |
 | `compute_cooc_boost()` | Calcula cooc_boost(e, R) a partir del mapa de co-ocurrencias |
