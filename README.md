@@ -1,3 +1,5 @@
+> **📖 [Full Documentation](https://cachorro.space/docs/mcp-memory)** — guides, API reference, architecture, and more at cachorro.space
+
 # mcp-memory
 
 A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) — with SQLite persistence, vector embeddings, semantic search, and **🧠 Limbic Scoring** for dynamic ranking.
