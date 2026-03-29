@@ -353,20 +353,7 @@ def open_nodes(names: list[str]) -> dict[str, Any]:
 
 
 # ============================================================
-# TOOL 9: read_graph
-# ============================================================
-@mcp.tool
-def read_graph() -> dict[str, Any]:
-    """Read the entire knowledge graph. Returns all entities with observations and all relations."""
-    try:
-        return store.read_graph()
-    except Exception as e:
-        logger.error("Error in read_graph: %s", e)
-        return {"error": str(e)}
-
-
-# ============================================================
-# TOOL 10: search_semantic
+# TOOL 9: search_semantic
 # ============================================================
 @mcp.tool
 def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:

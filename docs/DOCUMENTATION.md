@@ -44,7 +44,7 @@ El servidor oficial reescribe el archivo completo en cada operación. Sin lockin
 
 ### Compatibilidad con Anthropic MCP Memory
 
-De las 11 tools que expone MCP Memory v2, **9 son 100% compatibles** con la API de Anthropic:
+De las 10 tools que expone MCP Memory v2, **8 son 100% compatibles** con la API de Anthropic:
 
 | Tool | Compatibilidad |
 |---|---|
@@ -56,7 +56,6 @@ De las 11 tools que expone MCP Memory v2, **9 son 100% compatibles** con la API 
 | `delete_relations` | ✅ Anthropic |
 | `search_nodes` | ✅ Anthropic |
 | `open_nodes` | ✅ Anthropic |
-| `read_graph` | ✅ Anthropic |
 | `search_semantic` | 🆕 Nueva |
 | `migrate` | 🆕 Nueva |
 
@@ -114,8 +113,8 @@ MCP Memory v2 sigue una arquitectura en capas con tres componentes principales: 
 ┌──────────────────────────────────────┐
 │         FastMCP Server               │
 │  ┌────────────────────────────┐      │
-│  │   11 MCP Tools             │      │
-│  │   (9 Anthropic + 2 new)    │      │
+│  │   10 MCP Tools             │      │
+│  │   (8 Anthropic + 2 new)    │      │
 │  └────┬──────────────┬────────┘      │
 │       │              │               │
 │  ┌────▼──────┐ ┌────▼──────────┐     │
@@ -328,7 +327,7 @@ El `EmbeddingEngine` encapsula toda la lógica de inferencia de embeddings usand
 └─────────────────────────────────────────────┘
 ```
 
-El servidor **arranca sin modelo**. Las 9 tools compatibles con Anthropic funcionan inmediatamente (usan solo SQLite). El motor de embeddings se inicializa bajo demanda la primera vez que se necesita: ya sea una llamada a `search_semantic`, o una operación de escritura que recalcula embeddings (`create_entities`, `add_observations`, `delete_observations`).
+El servidor **arranca sin modelo**. Las 8 tools compatibles con Anthropic funcionan inmediatamente (usan solo SQLite). El motor de embeddings se inicializa bajo demanda la primera vez que se necesita: ya sea una llamada a `search_semantic`, o una operación de escritura que recalcula embeddings (`create_entities`, `add_observations`, `delete_observations`).
 
 Si los archivos del modelo no están en disco, `engine.available` es `False` y el servidor continúa funcionando — las operaciones CRUD siguen normales, pero la búsqueda semántica y el recálculo de embeddings se saltan silenciosamente (con un log de advertencia).
 
@@ -773,7 +772,7 @@ Los modelos Pydantic cumplen una función dual en MCP Memory v2:
 1. **Validación de inputs**: Cada MCP tool recibe datos del cliente (típicamente JSON). Los modelos validan que la estructura y los tipos sean correctos antes de tocar la base de datos.
 2. **Serialización de outputs**: Las respuestas de las tools se serializan a JSON de forma consistente y tipada, garantizando que el cliente reciba siempre la misma estructura.
 
-En total, las **11 MCP tools** usan estos modelos para validar y devolver datos sobre entidades y relaciones.
+En total, las **10 MCP tools** usan estos modelos para validar y devolver datos sobre entidades y relaciones.
 
 ### `EntityInput`
 
@@ -888,9 +887,9 @@ class RelationOutput(BaseModel):
 
 ## MCP Tools
 
-MCP Memory v2 expone 11 tools vía el protocolo MCP. Las primeras 9 son **100% compatibles** con el formato del servidor MCP Memory de Anthropic, lo que permite usarlo como drop-in replacement. Las 2 restantes son extensiones propias que añaden búsqueda semántica y migración desde el formato JSONL original.
+MCP Memory v2 expone 10 tools vía el protocolo MCP. Las primeras 8 son **100% compatibles** con el formato del servidor MCP Memory de Anthropic, lo que permite usarlo como drop-in replacement. Las 2 restantes son extensiones propias que añaden búsqueda semántica y migración desde el formato JSONL original.
 
-### Tools compatibles con Anthropic (9)
+### Tools compatibles con Anthropic (8)
 
 #### 1. `create_entities`
 
@@ -922,7 +921,7 @@ Cada dict dentro de `entities` se valida con el modelo `EntityInput` de Pydantic
       "entityType": "Sistema",
       "observations": [
         "Stack: FastMCP + SQLite-vec + ONNX embeddings",
-        "11 tools MCP: 9 Anthropic-compat + 2 nuevos"
+        "10 tools MCP: 8 Anthropic-compat + 2 nuevos"
       ]
     }
   ]
@@ -1240,7 +1239,7 @@ Con errores:
       "name": "MCP Memory v2",
       "entityType": "Sistema",
       "observations": [
-        "11 tools MCP: 9 Anthropic-compat + 2 nuevos",
+        "10 tools MCP: 8 Anthropic-compat + 2 nuevos",
         "Ubicación: ~/.config/opencode/mcp-memory/"
       ]
     }
@@ -1251,53 +1250,11 @@ Con errores:
 **Notas**:
 - Búsqueda por **nombre exacto** (`WHERE name = ?`). No usa patrones ni LIKE.
 - Si un nombre no coincide con ninguna entidad, simplemente no se incluye en los resultados (no hay error).
-- **No incluye relaciones** en la respuesta. Para obtener relaciones, use `read_graph`.
+- **No incluye relaciones** en la respuesta. Para obtener relaciones, use `search_nodes` con una consulta relevante o `search_semantic`.
 
 ---
 
-#### 9. `read_graph`
-
-**Descripción**: Read the entire knowledge graph. Returns all entities with observations and all relations.
-
-**Firma**: `read_graph() → dict[str, Any]`
-
-**Parámetros**: Ninguno.
-
-**Respuesta**:
-
-```json
-{
-  "entities": [
-    {
-      "name": "MCP Memory v2",
-      "entityType": "Sistema",
-      "observations": [
-        "11 tools MCP: 9 Anthropic-compat + 2 nuevos",
-        "Repositorio: https://github.com/Yarlan1503/mcp-memory (MIT)"
-      ]
-    }
-  ],
-  "relations": [
-    {
-      "from": "Sesión 2026-03-21",
-      "to": "MCP Memory v2",
-      "relationType": "creo"
-    }
-  ]
-}
-```
-
-**Notas**:
-- Retorna el **dump completo** del grafo en formato Anthropic-compatible.
-- Para cada entidad se incluye su lista completa de observaciones (ordenadas por `id`).
-- Las relaciones se resuelven con `JOIN` para incluir nombres de entidades en lugar de IDs numéricos.
-- **Costoso en tokens**: con un grafo grande, esta tool puede retornar miles de líneas. Prefiera `search_nodes` o `search_semantic` para consultas específicas.
-
----
-
-### Tools nuevas de MCP Memory v2 (2)
-
-#### 10. `search_semantic`
+#### 9. `search_semantic`
 
 **Descripción**: Semantic search using vector embeddings with optional full-text hybrid search. Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion, then applies limbic re-ranking based on access patterns and co-occurrence. Requires the embedding model to be downloaded (run `download_model.py` first).
 
@@ -1319,7 +1276,7 @@ Con errores:
       "name": "MCP Memory v2",
       "entityType": "Sistema",
       "observations": [
-        "11 tools MCP: 9 Anthropic-compat + 2 nuevos",
+        "10 tools MCP: 8 Anthropic-compat + 2 nuevos",
         "Stack: FastMCP 3.1.1 + sqlite-vec + ONNX"
       ],
       "limbic_score": 0.6742,
@@ -1412,7 +1369,6 @@ Error (modelo no disponible):
 | `delete_relations` | ❌ No | Ídem. |
 | `search_nodes` | ❌ No | Búsqueda LIKE, no requiere embeddings. |
 | `open_nodes` | ❌ No | Lectura directa por nombre exacto. |
-| `read_graph` | ❌ No | Dump completo, operación de solo lectura. |
 | `search_semantic` | 📖 Usa (lectura) | Codifica el query, busca por cosine distance, re-rankea con Limbic Scoring. Registra access + co-occurrences post-response. |
 | `migrate` | ✅ Sí (batch) | Genera embeddings para todas las entidades importadas al final. |
 

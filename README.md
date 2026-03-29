@@ -8,7 +8,7 @@ A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com
 
 ## Features
 
-- **Drop-in compatible** with Anthropic's 9 MCP tools (same API, same behavior)
+- **Drop-in compatible** with Anthropic's 8 MCP tools (same API, same behavior)
 - **SQLite + WAL** — safe concurrent access, no more corrupted JSONL
 - **Semantic search** via sqlite-vec + ONNX embeddings (94+ languages)
 - **Hybrid search** (FTS5 + KNN) — combines full-text BM25 and semantic vector search via Reciprocal Rank Fusion. Finds entities by exact terms or semantic similarity — or both at once.
@@ -69,7 +69,7 @@ print(result)
 
 ## MCP Tools
 
-### Compatible with Anthropic (9 tools)
+### Compatible with Anthropic (8 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -81,7 +81,6 @@ print(result)
 | `delete_relations` | Delete specific relations |
 | `search_nodes` | Search by substring (name, type, observation content) |
 | `open_nodes` | Retrieve entities by name |
-| `read_graph` | Read the entire knowledge graph |
 
 ### New tools (2)
 

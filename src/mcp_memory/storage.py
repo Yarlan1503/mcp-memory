@@ -730,33 +730,3 @@ class MemoryStore:
         except Exception as exc:
             logger.warning("FTS5 search failed: %s", exc)
             return []
-
-    # ------------------------------------------------------------------
-    # Read graph (Anthropic-compatible format)
-    # ------------------------------------------------------------------
-
-    def read_graph(self) -> dict:
-        """Returns entire graph in Anthropic-compatible format:
-        {
-            "entities": [{"name": "...", "entityType": "...", "observations": [...]}],
-            "relations": [{"from": "...", "to": "...", "relationType": "..."}]
-        }
-        """
-        entities_rows = self.db.execute(
-            "SELECT id, name, entity_type FROM entities"
-        ).fetchall()
-
-        entities: list[dict] = []
-        for row in entities_rows:
-            obs = self.get_observations(row["id"])
-            entities.append(
-                {
-                    "name": row["name"],
-                    "entityType": row["entity_type"],
-                    "observations": obs,
-                }
-            )
-
-        relations = self.get_all_relations()
-
-        return {"entities": entities, "relations": relations}
