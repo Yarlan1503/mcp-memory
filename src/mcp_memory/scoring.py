@@ -5,6 +5,7 @@ Transparent to the external API — same output format as plain KNN."""
 
 import math
 from datetime import datetime, timezone
+from typing import Any
 
 # ------------------------------------------------------------------
 # Tuneable constants
@@ -14,6 +15,9 @@ BETA_SAL = 0.5  # Salience boost factor
 BETA_DEG = 0.15  # Degree weight
 D_MAX = 15  # Degree cap
 LAMBDA_HOURLY = 0.0001  # Decay rate per hour (half-life ~290 days)
+COOC_TEMPORAL_FLOOR = (
+    0.1  # Floor for co-occurrence decay (knowledge degrades but isn't destroyed)
+)
 GAMMA = (
     0.01  # Co-occurrence weight per pair (reduced from 0.1 — 0.1 dominated scoring 24x)
 )
@@ -30,6 +34,23 @@ RRF_K = 60  # RRF constant (default from original paper)
 def _parse_sqlite_datetime(dt_str: str) -> datetime:
     """Parse SQLite datetime string ('YYYY-MM-DD HH:MM:SS') to UTC datetime."""
     return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def compute_cooc_decay(last_co_str: str) -> float:
+    """Compute temporal decay factor for co-occurrences.
+
+    cooc_decay = max(COOC_TEMPORAL_FLOOR, exp(-LAMBDA_HOURLY × Δt_hours))
+
+    Uses the same half-life (~290 days) as compute_temporal_factor.
+    """
+    try:
+        dt = _parse_sqlite_datetime(last_co_str)
+    except (ValueError, TypeError):
+        return 1.0  # Can't parse → no decay (neutral)
+
+    now = datetime.now(timezone.utc)
+    delta_hours = max(0.0, (now - dt).total_seconds() / 3600.0)
+    return max(COOC_TEMPORAL_FLOOR, math.exp(-LAMBDA_HOURLY * delta_hours))
 
 
 def compute_importance(
@@ -75,20 +96,26 @@ def compute_temporal_factor(last_access_str: str, created_at_str: str) -> float:
 def compute_cooc_boost(
     entity_id: int,
     result_ids: list[int],
-    cooc_map: dict[tuple[int, int], int],
+    cooc_map: dict[tuple[int, int], dict[str, Any]],
 ) -> float:
-    """Compute co-occurrence boost.
+    """Compute co-occurrence boost with temporal decay.
 
-    cooc_boost(e, R) = Σ_{r ∈ R, r ≠ e} log2(1 + co_count(e, r))
+    cooc_boost(e, R) = Σ_{r ∈ R, r ≠ e} log2(1 + co_count(e, r)) × decay(last_co(e, r))
+
+    Decay uses the same half-life (~290 days) as compute_temporal_factor.
     """
     total = 0.0
     for other_id in result_ids:
         if other_id == entity_id:
             continue
         a, b = min(entity_id, other_id), max(entity_id, other_id)
-        co_count = cooc_map.get((a, b), 0)
-        if co_count > 0:
-            total += math.log2(1 + co_count)
+        cooc_info = cooc_map.get((a, b))
+        if cooc_info:
+            co_count = cooc_info.get("co_count", 0)
+            last_co_str = cooc_info.get("last_co", "")
+            if co_count > 0:
+                decay = compute_cooc_decay(last_co_str)
+                total += math.log2(1 + co_count) * decay
     return total
 
 
@@ -155,7 +182,7 @@ def rank_candidates(
     knn_results: list[dict],
     access_data: dict[int, dict],
     degree_data: dict[int, int],
-    cooc_data: dict[tuple[int, int], int],
+    cooc_data: dict[tuple[int, int], dict[str, Any]],
     entity_created: dict[int, str],
     limit: int,
 ) -> list[dict]:
@@ -170,7 +197,7 @@ def rank_candidates(
         knn_results: [{"entity_id": int, "distance": float}] from KNN.
         access_data: {entity_id: {"access_count": int, "last_access": str}}.
         degree_data: {entity_id: degree_count}.
-        cooc_data: {(id_a, id_b): co_count}.
+        cooc_data: {(id_a, id_b): {"co_count": int, "last_co": str}}.
         entity_created: {entity_id: created_at_str}.
         limit: Number of results to return (top-K).
 
@@ -244,7 +271,7 @@ def rank_hybrid_candidates(
     merged_results: list[dict],
     access_data: dict[int, dict],
     degree_data: dict[int, int],
-    cooc_data: dict[tuple[int, int], int],
+    cooc_data: dict[tuple[int, int], dict[str, Any]],
     entity_created: dict[int, str],
     limit: int,
 ) -> list[dict]:
@@ -268,7 +295,7 @@ def rank_hybrid_candidates(
             from reciprocal_rank_fusion(), ordered by rrf_score.
         access_data: {entity_id: {"access_count": int, "last_access": str}}.
         degree_data: {entity_id: degree_count}.
-        cooc_data: {(id_a, id_b): co_count}.
+        cooc_data: {(id_a, id_b): {"co_count": int, "last_co": str}}.
         entity_created: {entity_id: created_at_str}.
         limit: Number of results to return (top-K).
 

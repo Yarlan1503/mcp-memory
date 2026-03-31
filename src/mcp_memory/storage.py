@@ -4,6 +4,7 @@ import sqlite3
 
 import logging
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,43 @@ class MemoryStore:
                 last_co      TEXT    NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (entity_a_id, entity_b_id)
             );
+
+            CREATE TABLE IF NOT EXISTS search_events (
+                event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_text   TEXT    NOT NULL,
+                query_hash   TEXT    NOT NULL,
+                timestamp    TEXT    NOT NULL DEFAULT (datetime('now')),
+                treatment    INTEGER NOT NULL,
+                k_limit      INTEGER NOT NULL,
+                num_results  INTEGER NOT NULL,
+                duration_ms  REAL,
+                engine_used  TEXT    NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS search_results (
+                result_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id       INTEGER NOT NULL REFERENCES search_events(event_id),
+                entity_id      INTEGER NOT NULL,
+                entity_name    TEXT    NOT NULL,
+                rank           INTEGER NOT NULL,
+                limbic_score   REAL,
+                cosine_sim     REAL,
+                importance     REAL,
+                temporal       REAL,
+                cooc_boost     REAL,
+                baseline_rank  INTEGER,
+                UNIQUE(event_id, entity_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS implicit_feedback (
+                feedback_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id      INTEGER NOT NULL REFERENCES search_events(event_id),
+                entity_id     INTEGER NOT NULL,
+                re_accessed   INTEGER NOT NULL DEFAULT 0,
+                access_delta  INTEGER,
+                session_id    TEXT,
+                FOREIGN KEY (event_id, entity_id) REFERENCES search_results(event_id, entity_id)
+            );
             """
         )
 
@@ -134,6 +172,11 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_entities_type  ON entities(entity_type);
             CREATE INDEX IF NOT EXISTS idx_access_last    ON entity_access(last_access);
             CREATE INDEX IF NOT EXISTS idx_cooc_b         ON co_occurrences(entity_b_id);
+            CREATE INDEX IF NOT EXISTS idx_search_events_hash  ON search_events(query_hash);
+            CREATE INDEX IF NOT EXISTS idx_search_events_time  ON search_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_search_results_event ON search_results(event_id);
+            CREATE INDEX IF NOT EXISTS idx_search_results_entity ON search_results(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_implicit_event      ON implicit_feedback(event_id);
             """
         )
 
@@ -622,23 +665,28 @@ class MemoryStore:
                 )
         self.db.commit()
 
-    def get_co_occurrences(self, entity_ids: list[int]) -> dict[tuple[int, int], int]:
+    def get_co_occurrences(
+        self, entity_ids: list[int]
+    ) -> dict[tuple[int, int], dict[str, Any]]:
         """Get co-occurrence counts for pairs within a set of entity IDs.
-        Returns dict with (id_a, id_b) -> co_count, where id_a < id_b."""
+        Returns dict with (id_a, id_b) -> {"co_count": int, "last_co": str}, where id_a < id_b."""
         if len(entity_ids) < 2:
             return {}
         id_set = set(entity_ids)
         placeholders = ",".join("?" for _ in entity_ids)
         rows = self.db.execute(
             f"""
-            SELECT entity_a_id, entity_b_id, co_count
+            SELECT entity_a_id, entity_b_id, co_count, last_co
             FROM co_occurrences
             WHERE entity_a_id IN ({placeholders}) AND entity_b_id IN ({placeholders})
             """,
             entity_ids + entity_ids,
         ).fetchall()
         return {
-            (r["entity_a_id"], r["entity_b_id"]): r["co_count"]
+            (r["entity_a_id"], r["entity_b_id"]): {
+                "co_count": r["co_count"],
+                "last_co": r["last_co"],
+            }
             for r in rows
             if r["entity_a_id"] in id_set and r["entity_b_id"] in id_set
         }
@@ -730,3 +778,88 @@ class MemoryStore:
         except Exception as exc:
             logger.warning("FTS5 search failed: %s", exc)
             return []
+
+    # ------------------------------------------------------------------
+    # A/B Testing: Search event logging
+    # ------------------------------------------------------------------
+
+    def log_search_event(
+        self,
+        query_text: str,
+        treatment: int,
+        k_limit: int,
+        num_results: int,
+        duration_ms: float | None,
+        engine_used: str,
+    ) -> int:
+        """Log a search event. Returns the new event_id."""
+        import hashlib
+
+        query_hash = hashlib.md5(query_text.encode()).hexdigest()
+        cursor = self.db.execute(
+            """
+            INSERT INTO search_events (query_text, query_hash, treatment, k_limit, num_results, duration_ms, engine_used)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                query_text,
+                query_hash,
+                treatment,
+                k_limit,
+                num_results,
+                duration_ms,
+                engine_used,
+            ),
+        )
+        self.db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    def log_search_results(
+        self,
+        event_id: int,
+        results: list[dict],
+    ) -> None:
+        """Log search results for an event.
+
+        Uses INSERT OR IGNORE to handle UNIQUE constraint on (event_id, entity_id).
+        Skips results that already have an entry for the same event_id+entity_id pair.
+        """
+        for r in results:
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO search_results
+                (event_id, entity_id, entity_name, rank, limbic_score, cosine_sim, importance, temporal, cooc_boost, baseline_rank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    r["entity_id"],
+                    r["entity_name"],
+                    r["rank"],
+                    r.get("limbic_score"),
+                    r.get("cosine_sim"),
+                    r.get("importance"),
+                    r.get("temporal"),
+                    r.get("cooc_boost"),
+                    r.get("baseline_rank"),
+                ),
+            )
+        self.db.commit()
+
+    def log_implicit_feedback(
+        self,
+        event_id: int,
+        entity_id: int,
+        re_accessed: bool,
+        access_delta: int | None,
+        session_id: str | None,
+    ) -> None:
+        """Log implicit feedback for a search result."""
+        self.db.execute(
+            """
+            INSERT INTO implicit_feedback (event_id, entity_id, re_accessed, access_delta, session_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, entity_id, int(re_accessed), access_delta, session_id),
+        )
+        self.db.commit()

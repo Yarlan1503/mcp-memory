@@ -1,5 +1,8 @@
+import hashlib
 import logging
+import random
 import sys
+import time
 from typing import Any
 
 from fastmcp import FastMCP
@@ -355,6 +358,62 @@ def open_nodes(names: list[str]) -> dict[str, Any]:
 # ============================================================
 # TOOL 9: search_semantic
 # ============================================================
+
+# --- A/B Testing Configuration ---
+USE_AB_TESTING = True
+BASELINE_PROBABILITY = 0.1  # 10% of queries are baseline (treatment=0)
+
+
+def _compute_baseline_ranking(
+    knn_results: list[dict],
+    candidate_ids: list[int],
+) -> list[dict]:
+    """Compute baseline ranking (cosine-only) for A/B comparison.
+
+    Returns list sorted by cosine_sim descending with baseline_rank assigned.
+    Only includes entities present in knn_results (has distance).
+    """
+    baseline = []
+    for item in knn_results:
+        eid = item["entity_id"]
+        distance = item.get("distance", 1.0)
+        cosine_sim = max(0.0, 1.0 - distance)
+        baseline.append(
+            {
+                "entity_id": eid,
+                "cosine_sim": cosine_sim,
+            }
+        )
+
+    # Sort by cosine_sim descending
+    baseline.sort(key=lambda x: x["cosine_sim"], reverse=True)
+
+    # Assign baseline_rank (1-based)
+    for rank, item in enumerate(baseline, start=1):
+        item["baseline_rank"] = rank
+
+    return baseline
+
+
+def _get_treatment(query: str) -> int:
+    """Determine A/B treatment for a query.
+
+    Uses hash-based determinism if random is unavailable.
+    Returns 0 for baseline (cosine-only), 1 for limbic scoring.
+    """
+    if not USE_AB_TESTING:
+        return 1  # Default to limbic
+
+    # Try random first
+    try:
+        return 0 if random.random() < BASELINE_PROBABILITY else 1
+    except Exception:
+        # Fallback: hash-based determinism for reproducibility
+        query_hash = hashlib.md5(query.encode()).hexdigest()
+        hash_value = int(query_hash, 16) % 100
+        return 0 if hash_value < (BASELINE_PROBABILITY * 100) else 1
+
+
 @mcp.tool
 def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
     """Semantic search using vector embeddings with optional full-text hybrid search.
@@ -367,6 +426,9 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             return {
                 "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
             }
+
+        # --- A/B Testing: Determine treatment ---
+        treatment = _get_treatment(query)
 
         from mcp_memory.embeddings import serialize_f32
         from mcp_memory.scoring import (
@@ -401,7 +463,10 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             merged = None
             candidate_ids = [r["entity_id"] for r in knn_results]
 
-        # --- Step 4: Fetch limbic signals for all candidates ---
+        # --- SHADOW MODE: Compute baseline ranking for A/B comparison ---
+        baseline_ranked = _compute_baseline_ranking(knn_results, candidate_ids)
+
+        # Prepare limbic data for logging (needed for both treatments)
         access_data = store.get_access_data(candidate_ids)
         degree_data = store.get_entity_degrees(candidate_ids)
         cooc_data = store.get_co_occurrences(candidate_ids)
@@ -412,67 +477,170 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             if row:
                 entity_created[eid] = row["created_at"]
 
-        # --- Step 5: Re-rank with limbic scoring ---
-        if use_hybrid:
-            ranked = rank_hybrid_candidates(
-                merged_results=merged,
-                access_data=access_data,
-                degree_data=degree_data,
-                cooc_data=cooc_data,
-                entity_created=entity_created,
-                limit=limit,
-            )
-        else:
-            ranked = rank_candidates(
-                knn_results=knn_results,
-                access_data=access_data,
-                degree_data=degree_data,
-                cooc_data=cooc_data,
-                entity_created=entity_created,
-                limit=limit,
-            )
+        # --- SHADOW MODE: Log to database (best-effort, non-blocking) ---
+        shadow_start_time = time.perf_counter()
 
-        # --- Step 6: Build output ---
+        try:
+            # Log event
+            event_id = store.log_search_event(
+                query_text=query,
+                treatment=treatment,
+                k_limit=limit,
+                num_results=None,  # Will update after ranking
+                duration_ms=None,
+                engine_used="limbic" if treatment == 1 else "baseline",
+            )
+        except Exception as e:
+            logger.warning("Shadow mode event logging failed: %s", e)
+            event_id = None
+
+        # --- Step 4: Re-rank based on treatment ---
+        if treatment == 0:
+            # BASELINE: Use cosine-only ranking (no limbic scoring)
+            ranked = baseline_ranked[:limit]
+        else:
+            # LIMBIC: Apply limbic re-ranking
+            if use_hybrid:
+                ranked = rank_hybrid_candidates(
+                    merged_results=merged,
+                    access_data=access_data,
+                    degree_data=degree_data,
+                    cooc_data=cooc_data,
+                    entity_created=entity_created,
+                    limit=limit,
+                )
+            else:
+                ranked = rank_candidates(
+                    knn_results=knn_results,
+                    access_data=access_data,
+                    degree_data=degree_data,
+                    cooc_data=cooc_data,
+                    entity_created=entity_created,
+                    limit=limit,
+                )
+
+        # --- Build output based on treatment ---
         output = []
         top_k_ids = []
-        for item in ranked:
-            eid = item["entity_id"]
-            row = store.get_entity_by_id(eid)
-            if not row:
-                continue
 
-            obs = store.get_observations(eid)
-            result_item = {
-                "name": row["name"],
-                "entityType": row["entity_type"],
-                "observations": obs,
-                "limbic_score": round(item["limbic_score"], 4),
-                "scoring": {
-                    "importance": round(item["importance"], 4),
-                    "temporal_factor": round(item["temporal_factor"], 4),
-                    "cooc_boost": round(item["cooc_boost"], 4),
-                },
-            }
+        if treatment == 0:
+            # BASELINE output: cosine-only ranking, no limbic scores
+            for rank_pos, item in enumerate(ranked):
+                eid = item["entity_id"]
+                row = store.get_entity_by_id(eid)
+                if not row:
+                    continue
 
-            # Add distance if available (semantic results have it, FTS-only don't)
-            if item.get("distance") is not None:
-                result_item["distance"] = round(item["distance"], 4)
+                obs = store.get_observations(eid)
+                result_item = {
+                    "name": row["name"],
+                    "entityType": row["entity_type"],
+                    "observations": obs,
+                    "distance": round(1.0 - item.get("cosine_sim", 0.0), 4),
+                    "treatment": "baseline",
+                }
 
-            # Add rrf_score if hybrid mode
-            if use_hybrid and item.get("rrf_score") is not None:
-                result_item["rrf_score"] = round(item["rrf_score"], 6)
+                # Add cosine_sim for baseline
+                result_item["cosine_sim"] = round(item.get("cosine_sim", 0.0), 4)
 
-            output.append(result_item)
-            top_k_ids.append(eid)
+                output.append(result_item)
+                top_k_ids.append(eid)
+        else:
+            # LIMBIC output: full scoring details
+            for item in ranked:
+                eid = item["entity_id"]
+                row = store.get_entity_by_id(eid)
+                if not row:
+                    continue
 
-        # Limbic: record access + co-occurrences for top-K (post-response, best-effort)
-        try:
-            for eid in top_k_ids:
-                store.record_access(eid)
-            if len(top_k_ids) >= 2:
-                store.record_co_occurrences(top_k_ids)
-        except Exception as e:
-            logger.warning("Limbic tracking failed: %s", e)
+                obs = store.get_observations(eid)
+                result_item = {
+                    "name": row["name"],
+                    "entityType": row["entity_type"],
+                    "observations": obs,
+                    "limbic_score": round(item.get("limbic_score", 0.0), 4),
+                    "scoring": {
+                        "importance": round(item.get("importance", 0.0), 4),
+                        "temporal_factor": round(item.get("temporal_factor", 1.0), 4),
+                        "cooc_boost": round(item.get("cooc_boost", 0.0), 4),
+                    },
+                }
+
+                # Add distance if available (semantic results have it, FTS-only don't)
+                if item.get("distance") is not None:
+                    result_item["distance"] = round(item["distance"], 4)
+
+                # Add rrf_score if hybrid mode
+                if use_hybrid and item.get("rrf_score") is not None:
+                    result_item["rrf_score"] = round(item["rrf_score"], 6)
+
+                output.append(result_item)
+                top_k_ids.append(eid)
+
+        # --- Update shadow mode logging with results ---
+        if event_id is not None:
+            try:
+                # Map entity_id -> baseline_rank for logging
+                baseline_map = {
+                    r["entity_id"]: r["baseline_rank"] for r in baseline_ranked
+                }
+
+                # Prepare results for logging (top-k only)
+                results_to_log = []
+                for rank_pos, rank_item in enumerate(ranked):
+                    eid = rank_item["entity_id"]
+                    row = store.get_entity_by_id(eid)
+                    if not row:
+                        continue
+
+                    log_entry = {
+                        "entity_id": eid,
+                        "entity_name": row["name"],
+                        "rank": rank_pos + 1,
+                        "baseline_rank": baseline_map.get(eid),
+                    }
+
+                    if treatment == 1:
+                        # LIMBIC: include full scoring details
+                        log_entry["limbic_score"] = rank_item.get("limbic_score", 0.0)
+                        log_entry["cosine_sim"] = max(
+                            0.0, 1.0 - rank_item.get("distance", 1.0)
+                        )
+                        log_entry["importance"] = rank_item.get("importance", 0.0)
+                        log_entry["temporal"] = rank_item.get("temporal_factor", 1.0)
+                        log_entry["cooc_boost"] = rank_item.get("cooc_boost", 0.0)
+                    else:
+                        # BASELINE: only cosine similarity
+                        log_entry["cosine_sim"] = rank_item.get("cosine_sim", 0.0)
+
+                    results_to_log.append(log_entry)
+
+                store.log_search_results(event_id, results_to_log)
+
+                # Update event with final count and duration
+                duration_ms = (time.perf_counter() - shadow_start_time) * 1000
+                try:
+                    store.db.execute(
+                        "UPDATE search_events SET num_results = ?, duration_ms = ? WHERE event_id = ?",
+                        (len(output), duration_ms, event_id),
+                    )
+                    store.db.commit()
+                except Exception:
+                    pass  # Non-critical
+
+            except Exception as e:
+                logger.warning("Shadow mode result logging failed: %s", e)
+
+        # --- Limbic: record access + co-occurrences for top-K (post-response) ---
+        if treatment == 1:
+            # Only record limbic tracking for limbic queries
+            try:
+                for eid in top_k_ids:
+                    store.record_access(eid)
+                if len(top_k_ids) >= 2:
+                    store.record_co_occurrences(top_k_ids)
+            except Exception as e:
+                logger.warning("Limbic tracking failed: %s", e)
 
         return {"results": output}
 
