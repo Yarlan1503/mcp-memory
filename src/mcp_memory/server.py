@@ -310,14 +310,44 @@ def delete_relations(relations: list[dict[str, Any]]) -> dict[str, Any]:
 @mcp.tool
 def search_nodes(query: str) -> dict[str, Any]:
     """Search for nodes in the knowledge graph by name, type, or observation content."""
+    start_time = time.perf_counter()
+    event_id = None
     try:
         if not query.strip():
             return {"entities": []}
+
+        # --- SHADOW MODE: Log to database (best-effort, non-blocking) ---
+        try:
+            event_id = store.log_search_event(
+                query_text=query,
+                treatment=-1,  # LIKE search, no A/B test
+                k_limit=None,
+                num_results=None,  # Will update after query
+                duration_ms=None,
+                engine_used="like",
+            )
+        except Exception as e:
+            logger.warning("Shadow mode event logging failed: %s", e)
+            event_id = None
+
         entities = store.search_entities(query)
         results = []
         for entity in entities:
             obs = store.get_observations(entity["id"])
             results.append(_entity_to_output(entity, obs))
+
+        # Update event with final count and duration
+        if event_id is not None:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            try:
+                store.db.execute(
+                    "UPDATE search_events SET num_results = ?, duration_ms = ? WHERE event_id = ?",
+                    (len(results), duration_ms, event_id),
+                )
+                store.db.commit()
+            except Exception:
+                pass  # Non-critical
+
         return {"entities": results}
     except Exception as e:
         logger.error("Error in search_nodes: %s", e)
