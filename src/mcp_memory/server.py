@@ -464,15 +464,6 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                 "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
             }
 
-        # --- A/B Testing: Determine treatment ---
-        treatment = _get_treatment(query)
-
-        # --- Query Routing: Detect strategy for limbic queries ---
-        routing_strategy = None
-        if treatment == 1:
-            routing_strategy = detect_query_type(query, limit)
-            logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
-
         from mcp_memory.embeddings import serialize_f32
         from mcp_memory.scoring import (
             EXPANSION_FACTOR,
@@ -483,6 +474,15 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             rank_with_routing_strategy,
             reciprocal_rank_fusion,
         )
+
+        # --- A/B Testing: Determine treatment ---
+        treatment = _get_treatment(query)
+
+        # --- Query Routing: Detect strategy for limbic queries ---
+        routing_strategy = None
+        if treatment == 1:
+            routing_strategy = detect_query_type(query, limit)
+            logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
 
         # --- Step 1: Semantic KNN search ---
         query_vector = engine.encode([query], task="query")
