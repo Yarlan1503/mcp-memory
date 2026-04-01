@@ -1,4 +1,4 @@
-> **📖 [Full Documentation](https://cachorro.space/docs/mcp-memory)** — guides, API reference, architecture, and more at cachorro.space
+> **📖 [Full Documentation](https://cachorro.space/mcp-memory/getting-started/)** — guides, API reference, architecture, and more at cachorro.space
 
 # mcp-memory
 
