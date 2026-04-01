@@ -7,6 +7,12 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from mcp_memory.entity_splitter import (
+    analyze_entity_for_split,
+    propose_entity_split,
+    execute_entity_split,
+    find_all_split_candidates,
+)
 from mcp_memory.models import EntityInput, EntityOutput, RelationInput, RelationOutput
 from mcp_memory.storage import MemoryStore
 
@@ -321,8 +327,8 @@ def search_nodes(query: str) -> dict[str, Any]:
             event_id = store.log_search_event(
                 query_text=query,
                 treatment=-1,  # LIKE search, no A/B test
-                k_limit=None,
-                num_results=None,  # Will update after query
+                k_limit=0,
+                num_results=0,  # Will update after query
                 duration_ms=None,
                 engine_used="like",
             )
@@ -340,11 +346,12 @@ def search_nodes(query: str) -> dict[str, Any]:
         if event_id is not None:
             duration_ms = (time.perf_counter() - start_time) * 1000
             try:
-                store.db.execute(
-                    "UPDATE search_events SET num_results = ?, duration_ms = ? WHERE event_id = ?",
-                    (len(results), duration_ms, event_id),
+                store.update_search_event_completion(
+                    event_id=event_id,
+                    num_results=len(results),
+                    duration_ms=duration_ms,
+                    engine_used="like",
                 )
-                store.db.commit()
             except Exception:
                 pass  # Non-critical
 
@@ -460,11 +467,20 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
         # --- A/B Testing: Determine treatment ---
         treatment = _get_treatment(query)
 
+        # --- Query Routing: Detect strategy for limbic queries ---
+        routing_strategy = None
+        if treatment == 1:
+            routing_strategy = detect_query_type(query, limit)
+            logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
+
         from mcp_memory.embeddings import serialize_f32
         from mcp_memory.scoring import (
             EXPANSION_FACTOR,
+            RoutingStrategy,
+            detect_query_type,
             rank_candidates,
             rank_hybrid_candidates,
+            rank_with_routing_strategy,
             reciprocal_rank_fusion,
         )
 
@@ -529,25 +545,81 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             # BASELINE: Use cosine-only ranking (no limbic scoring)
             ranked = baseline_ranked[:limit]
         else:
-            # LIMBIC: Apply limbic re-ranking
-            if use_hybrid:
-                ranked = rank_hybrid_candidates(
-                    merged_results=merged,
-                    access_data=access_data,
-                    degree_data=degree_data,
-                    cooc_data=cooc_data,
-                    entity_created=entity_created,
-                    limit=limit,
-                )
+            # LIMBIC: Apply limbic re-ranking with dynamic routing
+            if routing_strategy == RoutingStrategy.HYBRID_BALANCED:
+                # For balanced queries, use limbic scoring as-is (already ~50/50 conceptually)
+                if use_hybrid:
+                    ranked = rank_hybrid_candidates(
+                        merged_results=merged,
+                        access_data=access_data,
+                        degree_data=degree_data,
+                        cooc_data=cooc_data,
+                        entity_created=entity_created,
+                        limit=limit,
+                    )
+                else:
+                    ranked = rank_candidates(
+                        knn_results=knn_results,
+                        access_data=access_data,
+                        degree_data=degree_data,
+                        cooc_data=cooc_data,
+                        entity_created=entity_created,
+                        limit=limit,
+                    )
+            elif routing_strategy in (
+                RoutingStrategy.COSINE_HEAVY,
+                RoutingStrategy.LIMBIC_HEAVY,
+            ):
+                # Apply weighted blending of cosine and limbic
+                if use_hybrid:
+                    ranked = rank_with_routing_strategy(
+                        merged_results=merged,
+                        access_data=access_data,
+                        degree_data=degree_data,
+                        cooc_data=cooc_data,
+                        entity_created=entity_created,
+                        limit=limit,
+                        strategy=routing_strategy,
+                    )
+                else:
+                    # For pure semantic, wrap knn_results in format expected
+                    knn_for_routing = [
+                        {
+                            "entity_id": r["entity_id"],
+                            "distance": r["distance"],
+                            "rrf_score": 1.0,
+                        }
+                        for r in knn_results
+                    ]
+                    ranked = rank_with_routing_strategy(
+                        merged_results=knn_for_routing,
+                        access_data=access_data,
+                        degree_data=degree_data,
+                        cooc_data=cooc_data,
+                        entity_created=entity_created,
+                        limit=limit,
+                        strategy=routing_strategy,
+                    )
             else:
-                ranked = rank_candidates(
-                    knn_results=knn_results,
-                    access_data=access_data,
-                    degree_data=degree_data,
-                    cooc_data=cooc_data,
-                    entity_created=entity_created,
-                    limit=limit,
-                )
+                # Fallback (shouldn't happen): use original limbic scoring
+                if use_hybrid:
+                    ranked = rank_hybrid_candidates(
+                        merged_results=merged,
+                        access_data=access_data,
+                        degree_data=degree_data,
+                        cooc_data=cooc_data,
+                        entity_created=entity_created,
+                        limit=limit,
+                    )
+                else:
+                    ranked = rank_candidates(
+                        knn_results=knn_results,
+                        access_data=access_data,
+                        degree_data=degree_data,
+                        cooc_data=cooc_data,
+                        entity_created=entity_created,
+                        limit=limit,
+                    )
 
         # --- Build output based on treatment ---
         output = []
@@ -594,6 +666,12 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         "temporal_factor": round(item.get("temporal_factor", 1.0), 4),
                         "cooc_boost": round(item.get("cooc_boost", 0.0), 4),
                     },
+                    "routing_strategy": item.get(
+                        "routing_strategy",
+                        routing_strategy.value
+                        if routing_strategy
+                        else "hybrid_balanced",
+                    ),
                 }
 
                 # Add distance if available (semantic results have it, FTS-only don't)
@@ -650,11 +728,12 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                 # Update event with final count and duration
                 duration_ms = (time.perf_counter() - shadow_start_time) * 1000
                 try:
-                    store.db.execute(
-                        "UPDATE search_events SET num_results = ?, duration_ms = ? WHERE event_id = ?",
-                        (len(output), duration_ms, event_id),
+                    store.update_search_event_completion(
+                        event_id=event_id,
+                        num_results=len(output),
+                        duration_ms=duration_ms,
+                        engine_used="limbic" if treatment == 1 else "baseline",
                     )
-                    store.db.commit()
                 except Exception:
                     pass  # Non-critical
 
@@ -701,6 +780,95 @@ def migrate(
         return result
     except Exception as e:
         logger.error("Error in migrate: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 12: analyze_entity_split
+# ============================================================
+@mcp.tool
+def analyze_entity_split(entity_name: str) -> dict[str, Any]:
+    """Analyze an entity and determine if it needs to be split.
+
+    An entity is a candidate for splitting when it exceeds the observation
+    threshold for its type (Sesion=15, Proyecto=25, otras=20) and has
+    sufficient topic diversity.
+
+    Returns a dict with analysis results including entity metadata,
+    observation count, threshold, detected topics, and split score."""
+    try:
+        analysis = analyze_entity_for_split(store, entity_name)
+        if analysis is None:
+            return {"error": f"Entity not found: {entity_name}"}
+        return {"analysis": analysis}
+    except Exception as e:
+        logger.error("Error in analyze_entity_split: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 13: propose_entity_split
+# ============================================================
+@mcp.tool
+def propose_entity_split_tool(entity_name: str) -> dict[str, Any]:
+    """Analyze and propose a split for an entity if needed.
+
+    Returns a split proposal with suggested new entity names,
+    topic groupings, and relations to create.
+    Returns None if the entity doesn't need splitting."""
+    try:
+        proposal = propose_entity_split(store, entity_name)
+        if proposal is None:
+            return {"proposal": None, "message": "Entity does not need splitting"}
+        return {"proposal": proposal}
+    except Exception as e:
+        logger.error("Error in propose_entity_split_tool: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 14: execute_entity_split
+# ============================================================
+@mcp.tool
+def execute_entity_split_tool(
+    entity_name: str,
+    approved_splits: list[dict[str, Any]],
+    parent_entity_name: str | None = None,
+) -> dict[str, Any]:
+    """Execute an approved entity split.
+
+    Creates new entities from the approved splits, moves observations,
+    and establishes contiene/parte_de relations between parent and children.
+
+    Args:
+        entity_name: Name of the original entity to split
+        approved_splits: List of approved split definitions, each with
+            name, entity_type, and observations
+        parent_entity_name: Optional explicit parent name (defaults to entity_name)"""
+    try:
+        result = execute_entity_split(
+            store, entity_name, approved_splits, parent_entity_name
+        )
+        return {"result": result}
+    except Exception as e:
+        logger.error("Error in execute_entity_split_tool: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 15: find_split_candidates
+# ============================================================
+@mcp.tool
+def find_split_candidates() -> dict[str, Any]:
+    """Find all entities in the knowledge graph that are candidates for splitting.
+
+    Scans all entities and returns those that exceed their type-specific
+    observation threshold and have sufficient topic diversity."""
+    try:
+        candidates = find_all_split_candidates(store)
+        return {"candidates": candidates}
+    except Exception as e:
+        logger.error("Error in find_split_candidates: %s", e)
         return {"error": str(e)}
 
 

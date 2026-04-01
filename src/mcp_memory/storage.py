@@ -294,37 +294,40 @@ class MemoryStore:
 
         id_placeholders = ",".join("?" for _ in ids)
 
-        try:
-            # 1. Delete embeddings (vec0 has no CASCADE support)
-            if self._vec_loaded:
-                try:
-                    self.db.execute(
-                        f"DELETE FROM entity_embeddings WHERE rowid IN ({id_placeholders})",
-                        ids,
-                    )
-                except Exception:
-                    logger.warning("Could not delete embeddings for entities %s", ids)
+        with self.db:
+            try:
+                # 1. Delete embeddings (vec0 has no CASCADE support)
+                if self._vec_loaded:
+                    try:
+                        self.db.execute(
+                            f"DELETE FROM entity_embeddings WHERE rowid IN ({id_placeholders})",
+                            ids,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not delete embeddings for entities %s", ids
+                        )
 
-            # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
-            if self._fts_available:
-                try:
-                    self.db.execute(
-                        f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
-                        ids,
-                    )
-                except Exception:
-                    logger.warning("Could not delete FTS entries for entities %s", ids)
+                # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
+                if self._fts_available:
+                    try:
+                        self.db.execute(
+                            f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
+                            ids,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not delete FTS entries for entities %s", ids
+                        )
 
-            # 3. Delete entities (CASCADE takes care of observations & relations)
-            self.db.execute(
-                f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
-            )
+                # 3. Delete entities (CASCADE takes care of observations & relations)
+                self.db.execute(
+                    f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
+                )
 
-            self.db.commit()
-            return len(ids)
-        except Exception:
-            self.db.rollback()
-            raise
+                return len(ids)
+            except Exception:
+                raise
 
     def search_entities(self, query: str) -> list[dict]:
         """
@@ -863,3 +866,27 @@ class MemoryStore:
             (event_id, entity_id, int(re_accessed), access_delta, session_id),
         )
         self.db.commit()
+
+    def update_search_event_completion(
+        self,
+        event_id: int,
+        num_results: int,
+        duration_ms: float,
+        engine_used: str,
+    ) -> None:
+        """Update num_results, duration_ms and engine_used for an existing search event."""
+        try:
+            self.db.execute(
+                """
+                UPDATE search_events
+                SET num_results = ?, duration_ms = ?, engine_used = ?
+                WHERE event_id = ?
+                """,
+                (num_results, duration_ms, engine_used, event_id),
+            )
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            logger.error(
+                "Failed to update search event %s completion: %s", event_id, exc
+            )

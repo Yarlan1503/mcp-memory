@@ -3,9 +3,24 @@
 Reranks KNN candidates using importance, temporal decay, and co-occurrence signals.
 Transparent to the external API — same output format as plain KNN."""
 
+import logging
 import math
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class RoutingStrategy(Enum):
+    """Estrategias de routing para search_semantic."""
+
+    COSINE_HEAVY = "cosine_heavy"  # 70% cosine, 30% limbic — queries factuales
+    LIMBIC_HEAVY = "limbic_heavy"  # 30% cosine, 70% limbic — queries exploratorias
+    HYBRID_BALANCED = (
+        "hybrid_balanced"  # 50% cosine, 50% limbic — queries de contexto amplio
+    )
+
 
 # ------------------------------------------------------------------
 # Tuneable constants
@@ -185,6 +200,8 @@ def rank_candidates(
     cooc_data: dict[tuple[int, int], dict[str, Any]],
     entity_created: dict[int, str],
     limit: int,
+    gamma: float | None = None,
+    beta_sal: float | None = None,
 ) -> list[dict]:
     """Re-rank KNN candidates using Opción B scoring.
 
@@ -246,8 +263,11 @@ def rank_candidates(
         cooc = compute_cooc_boost(eid, all_ids, cooc_data)
 
         # Opción B: product of all factors
+        # Use passed values or fall back to module constants
+        _gamma = gamma if gamma is not None else GAMMA
+        _beta_sal = beta_sal if beta_sal is not None else BETA_SAL
         limbic_score = (
-            cosine_sim * (1 + BETA_SAL * importance) * temporal * (1 + GAMMA * cooc)
+            cosine_sim * (1 + _beta_sal * importance) * temporal * (1 + _gamma * cooc)
         )
 
         scored.append(
@@ -274,6 +294,8 @@ def rank_hybrid_candidates(
     cooc_data: dict[tuple[int, int], dict[str, Any]],
     entity_created: dict[int, str],
     limit: int,
+    gamma: float | None = None,
+    beta_sal: float | None = None,
 ) -> list[dict]:
     """Re-rank RRF-merged candidates using limbic scoring.
 
@@ -358,8 +380,14 @@ def rank_hybrid_candidates(
         cooc = compute_cooc_boost(eid, all_ids, cooc_data)
 
         # Product of all factors (same formula as rank_candidates)
+        # Use passed values or fall back to module constants
+        _gamma = gamma if gamma is not None else GAMMA
+        _beta_sal = beta_sal if beta_sal is not None else BETA_SAL
         limbic_score = (
-            base_relevance * (1 + BETA_SAL * importance) * temporal * (1 + GAMMA * cooc)
+            base_relevance
+            * (1 + _beta_sal * importance)
+            * temporal
+            * (1 + _gamma * cooc)
         )
 
         scored.append(
@@ -375,4 +403,177 @@ def rank_hybrid_candidates(
         )
 
     scored.sort(key=lambda x: x["limbic_score"], reverse=True)
+    return scored[:limit]
+
+
+def detect_query_type(query_text: str, k_limit: int) -> RoutingStrategy:
+    """Detect query type based on linguistic features and k_limit.
+
+    Scoring rules:
+        - Factual keywords ("qué es", "definición", "cómo funciona", "es un/una") → +2
+        - Intermediate keywords ("relación", "diferencia", "ejemplos", "comparar") → +1
+        - Exploratory keywords ("explícame", "relación entre", "dime todo", "cuentame", "qué piensas") → -2
+        - Query length ≤3 words → +1 (factual)
+        - Query length ≥10 words → -1 (exploratory)
+        - K limit ≤3 → +1 (precise/factual)
+        - K limit ≥10 → -1 (exploratory)
+
+    Final routing:
+        - Score ≥ 2 → COSINE_HEAVY
+        - Score ≤ -2 → LIMBIC_HEAVY
+        - Otherwise → HYBRID_BALANCED
+
+    Args:
+        query_text: The search query string.
+        k_limit: The k limit parameter for the search.
+
+    Returns:
+        RoutingStrategy enum value.
+    """
+    query_lower = query_text.lower()
+    word_count = len(query_text.split())
+
+    score = 0
+
+    # Factual keywords (+2 each)
+    factual_keywords = ["qué es", "definición", "cómo funciona", "es un ", "es una "]
+    for kw in factual_keywords:
+        if kw in query_lower:
+            score += 2
+
+    # Intermediate keywords (+1 each)
+    intermediate_keywords = ["relación", "diferencia", "ejemplos", "comparar"]
+    for kw in intermediate_keywords:
+        if kw in query_lower:
+            score += 1
+
+    # Exploratory keywords (-2 each)
+    exploratory_keywords = [
+        "explícame",
+        "relación entre",
+        "dime todo",
+        "cuentame",
+        "qué piensas",
+    ]
+    for kw in exploratory_keywords:
+        if kw in query_lower:
+            score -= 2
+
+    # Query length scoring
+    if word_count <= 3:
+        score += 1  # Short query → factual
+    elif word_count >= 10:
+        score -= 1  # Long query → exploratory
+
+    # K limit scoring
+    if k_limit <= 3:
+        score += 1  # Small k → precise/factual
+    elif k_limit >= 10:
+        score -= 1  # Large k → exploratory
+
+    # Determine routing strategy
+    if score >= 2:
+        strategy = RoutingStrategy.COSINE_HEAVY
+    elif score <= -2:
+        strategy = RoutingStrategy.LIMBIC_HEAVY
+    else:
+        strategy = RoutingStrategy.HYBRID_BALANCED
+
+    logger.debug(f"Query '{query_text}' scored {score} → {strategy.value}")
+
+    return strategy
+
+
+def rank_with_routing_strategy(
+    merged_results: list[dict],
+    access_data: dict[int, dict],
+    degree_data: dict[int, int],
+    cooc_data: dict[tuple[int, int], dict[str, Any]],
+    entity_created: dict[int, str],
+    limit: int,
+    strategy: RoutingStrategy,
+    gamma: float | None = None,
+    beta_sal: float | None = None,
+) -> list[dict]:
+    """Re-rank merged candidates using a specified routing strategy.
+
+    First calls rank_hybrid_candidates() to compute limbic_score for each entity,
+    then blends cosine similarity with normalized limbic_score according to strategy.
+
+    Blending formulas:
+        - COSINE_HEAVY: 0.7 * cosine + 0.3 * limbic_norm
+        - LIMBIC_HEAVY: 0.3 * cosine + 0.7 * limbic_norm
+        - HYBRID_BALANCED: 0.5 * cosine + 0.5 * limbic_norm
+
+    Args:
+        merged_results: [{"entity_id": int, "rrf_score": float, "distance": float | None}]
+            from reciprocal_rank_fusion().
+        access_data: {entity_id: {"access_count": int, "last_access": str}}.
+        degree_data: {entity_id: degree_count}.
+        cooc_data: {(id_a, id_b): {"co_count": int, "last_co": str}}.
+        entity_created: {entity_id: created_at_str}.
+        limit: Number of results to return (top-K).
+        strategy: RoutingStrategy enum value.
+
+    Returns:
+        Top-K candidates sorted by final_score (descending).
+        Each item includes original fields plus "final_score" and "routing_strategy".
+    """
+    if not merged_results:
+        return []
+
+    # Step 1: Get limbic scores via rank_hybrid_candidates
+    limbic_results = rank_hybrid_candidates(
+        merged_results=merged_results,
+        access_data=access_data,
+        degree_data=degree_data,
+        cooc_data=cooc_data,
+        entity_created=entity_created,
+        limit=limit,
+        gamma=gamma,
+        beta_sal=beta_sal,
+    )
+
+    # Step 2: Collect cosine and limbic values for normalization
+    cosine_values = []
+    limbic_values = []
+
+    for item in limbic_results:
+        distance = item.get("distance")
+        if distance is not None:
+            cosine = max(0.0, 1.0 - distance)
+        else:
+            cosine = 0.0
+        cosine_values.append(cosine)
+        limbic_values.append(item["limbic_score"])
+
+    # Min-max normalization for limbic_score
+    limbic_min = min(limbic_values) if limbic_values else 0.0
+    limbic_max = max(limbic_values) if limbic_values else 1.0
+    limbic_range = limbic_max - limbic_min if limbic_max != limbic_min else 1.0
+
+    # Step 3: Apply blending based on strategy
+    if strategy == RoutingStrategy.COSINE_HEAVY:
+        cosine_weight, limbic_weight = 0.7, 0.3
+    elif strategy == RoutingStrategy.LIMBIC_HEAVY:
+        cosine_weight, limbic_weight = 0.3, 0.7
+    else:  # HYBRID_BALANCED
+        cosine_weight, limbic_weight = 0.5, 0.5
+
+    scored = []
+    for item in limbic_results:
+        distance = item.get("distance")
+        cosine = max(0.0, 1.0 - distance) if distance is not None else 0.0
+        limbic_norm = (item["limbic_score"] - limbic_min) / limbic_range
+
+        final_score = cosine_weight * cosine + limbic_weight * limbic_norm
+
+        result = dict(item)
+        result["final_score"] = final_score
+        result["routing_strategy"] = strategy.value
+        scored.append(result)
+
+    # Sort by final_score descending
+    scored.sort(key=lambda x: x["final_score"], reverse=True)
+
     return scored[:limit]
