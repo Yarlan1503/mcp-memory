@@ -12,6 +12,7 @@ from mcp_memory.entity_splitter import (
     propose_entity_split,
     execute_entity_split,
     find_all_split_candidates,
+    _get_threshold,
 )
 from mcp_memory.models import EntityInput, EntityOutput, RelationInput, RelationOutput
 from mcp_memory.storage import MemoryStore
@@ -981,6 +982,154 @@ def find_duplicate_observations(
 
     except Exception as e:
         logger.error("Error in find_duplicate_observations: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 17: consolidation_report
+# ============================================================
+def _preview_content(content: str, max_len: int = 80) -> str:
+    """Truncate content for preview display."""
+    if len(content) <= max_len:
+        return content
+    return content[:max_len] + "..."
+
+
+def _days_since_access_sql(last_access: str | None) -> int | None:
+    """Compute days since last access using SQLite julianday (avoids timezone issues)."""
+    if last_access is None:
+        return None
+    try:
+        row = store.db.execute(
+            "SELECT CAST(julianday('now') - julianday(?) AS INTEGER)",
+            (last_access,),
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+@mcp.tool
+def consolidation_report(stale_days: float = 90.0) -> dict[str, Any]:
+    """Generate a memory consolidation report without making any changes.
+
+    Analyzes the knowledge graph for:
+    - Split candidates: entities exceeding observation thresholds with sufficient topic diversity
+    - Flagged observations: observations marked as potential duplicates (similarity_flag=1)
+    - Stale entities: entities not accessed in N days with low access count
+    - Large entities: entities exceeding size thresholds (may need splitting)
+
+    Use this report to decide what consolidation actions to take.
+    The report is read-only — no changes are made to the knowledge graph."""
+    try:
+        # 1. Collect raw data from storage (read-only queries)
+        data = store.get_consolidation_data(stale_days)
+
+        # 2. Get split candidates from entity_splitter
+        split_candidates_raw = find_all_split_candidates(store)
+        split_candidate_names = {c["entity_name"] for c in split_candidates_raw}
+
+        # 3. Build split_candidates with recommendations
+        split_candidates: list[dict[str, Any]] = []
+        for c in split_candidates_raw:
+            ratio = (
+                c["observation_count"] / c["threshold"] if c["threshold"] > 0 else 0.0
+            )
+            split_candidates.append(
+                {
+                    "entity_name": c["entity_name"],
+                    "entity_type": c["entity_type"],
+                    "observation_count": c["observation_count"],
+                    "threshold": c["threshold"],
+                    "topic_diversity": round(c["split_score"], 2),
+                    "recommendation": (
+                        f"Split recommended — exceeds {c['threshold']} "
+                        f"by {ratio:.1f}x with topic diversity {c['split_score']:.2f}"
+                    ),
+                }
+            )
+
+        # 4. Build flagged_observations with content preview
+        flagged: dict[str, list[dict[str, Any]]] = {}
+        for entity_name, obs_list in data["flagged_observations"].items():
+            flagged[entity_name] = [
+                {
+                    "id": o["id"],
+                    "content_preview": _preview_content(o["content"]),
+                    "content_length": len(o["content"]),
+                }
+                for o in obs_list
+            ]
+
+        # 5. Build stale_entities with recommendations and days_since_access
+        stale_entities: list[dict[str, Any]] = []
+        for s in data["stale_entities"]:
+            days = _days_since_access_sql(s["last_access"])
+            if days is None:
+                recommendation = "Never accessed — consider archiving or deleting"
+            else:
+                recommendation = f"Not accessed in {days} days — consider archiving"
+            stale_entities.append(
+                {
+                    "entity_name": s["entity_name"],
+                    "entity_type": s["entity_type"],
+                    "observation_count": s["observation_count"],
+                    "last_access": s["last_access"],
+                    "access_count": s["access_count"],
+                    "days_since_access": days,
+                    "recommendation": recommendation,
+                }
+            )
+
+        # 6. Build large_entities
+        # Entities exceeding their type threshold but NOT identified as split
+        # candidates by entity_splitter. With the current splitting algorithm,
+        # all entities exceeding the threshold are split candidates, so this
+        # list may be empty. Included for future algorithm changes.
+        large_entities: list[dict[str, Any]] = []
+        for entity_name, obs_count in data["entity_sizes"].items():
+            if entity_name in split_candidate_names:
+                continue
+            entity = store.get_entity_by_name(entity_name)
+            if entity is None:
+                continue
+            threshold = _get_threshold(entity["entity_type"])
+            if obs_count > threshold:
+                ratio = obs_count / threshold if threshold > 0 else 0.0
+                if ratio < 1.5:
+                    rec = "Near threshold — monitor growth"
+                else:
+                    rec = f"Exceeds threshold by {ratio:.1f}x — evaluate for split"
+                large_entities.append(
+                    {
+                        "entity_name": entity_name,
+                        "entity_type": entity["entity_type"],
+                        "observation_count": obs_count,
+                        "threshold": threshold,
+                        "recommendation": rec,
+                    }
+                )
+
+        # 7. Count total flagged observations
+        total_flagged = sum(len(v) for v in data["flagged_observations"].values())
+
+        return {
+            "summary": {
+                "total_entities": data["total_entities"],
+                "total_observations": data["total_observations"],
+                "split_candidates_count": len(split_candidates),
+                "flagged_observations_count": total_flagged,
+                "stale_entities_count": len(stale_entities),
+                "large_entities_count": len(large_entities),
+            },
+            "split_candidates": split_candidates,
+            "flagged_observations": flagged,
+            "stale_entities": stale_entities,
+            "large_entities": large_entities,
+        }
+
+    except Exception as e:
+        logger.error("Error in consolidation_report: %s", e)
         return {"error": str(e)}
 
 
