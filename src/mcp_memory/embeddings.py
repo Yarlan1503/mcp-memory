@@ -1,6 +1,7 @@
 """Singleton ONNX embedding engine for semantic search."""
 
 import re
+import shutil
 import struct
 import logging
 from pathlib import Path
@@ -10,8 +11,16 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path.home() / ".cache" / "mcp-memory-v2" / "models"
-MODEL_NAME = "intfloat/multilingual-e5-small"
 DIMENSION = 384
+
+# --- Auto-download constants (shared with scripts/download_model.py) ---
+MODEL_REPO = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+_ROOT_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+]
+_ONNX_FILE = "onnx/model.onnx"
 
 # E5-small requires task prefixes for asymmetric retrieval
 QUERY_PREFIX = "query: "
@@ -37,6 +46,64 @@ def _lexical_diversity(text: str) -> float:
     return len(set(words)) / len(words)
 
 
+def _download_model_files(model_dir: Path) -> bool:
+    """Download ONNX model + tokenizer from HuggingFace to *model_dir*.
+
+    Returns ``True`` if **all** files were retrieved successfully,
+    ``False`` otherwise.  Errors are logged but never raised so that
+    the caller can degrade gracefully.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        logger.error(
+            "huggingface_hub not installed — cannot auto-download "
+            "embedding model.  Install with: pip install huggingface-hub"
+        )
+        return False
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    total = len(_ROOT_FILES) + 1  # tokenizer files + ONNX
+
+    # --- Root-level tokenizer files ------------------------------------
+    for filename in _ROOT_FILES:
+        try:
+            hf_hub_download(
+                repo_id=MODEL_REPO,
+                filename=filename,
+                local_dir=model_dir,
+            )
+            logger.info("Auto-downloaded %s", filename)
+            downloaded += 1
+        except Exception as exc:
+            logger.error("Failed to download %s: %s", filename, exc)
+
+    # --- ONNX model (nested under onnx/ in the HF repo) ---------------
+    try:
+        cached_onnx = hf_hub_download(
+            repo_id=MODEL_REPO,
+            filename=_ONNX_FILE,
+        )
+        dest = model_dir / "model.onnx"
+        shutil.copy2(cached_onnx, dest)
+        logger.info("Auto-downloaded model.onnx")
+        downloaded += 1
+    except Exception as exc:
+        logger.error("Failed to download model.onnx: %s", exc)
+
+    if downloaded == total:
+        logger.info("All %d model files auto-downloaded to %s", downloaded, model_dir)
+        return True
+
+    logger.error(
+        "Downloaded %d/%d model files — semantic search will be unavailable",
+        downloaded,
+        total,
+    )
+    return False
+
+
 class EmbeddingEngine:
     """Singleton ONNX embedding engine.
 
@@ -44,6 +111,10 @@ class EmbeddingEngine:
     (default ``~/.cache/mcp-memory-v2/models/``) and exposes an
     ``encode()`` method that returns L2-normalised float32 vectors
     suitable for cosine similarity search with sqlite-vec.
+
+    If the model files are not present on first use they are
+    automatically downloaded from HuggingFace (requires
+    ``huggingface-hub``).
     """
 
     _instance: "EmbeddingEngine | None" = None
@@ -85,11 +156,16 @@ class EmbeddingEngine:
             tokenizer_file = load_dir / "tokenizer.json"
 
             if not model_file.exists() or not tokenizer_file.exists():
-                logger.warning(
-                    "Model files not found at %s — embeddings unavailable",
+                logger.info(
+                    "Embedding model not found at %s — attempting auto-download",
                     load_dir,
                 )
-                return
+                if not _download_model_files(load_dir):
+                    logger.warning(
+                        "Auto-download failed — embeddings unavailable.  "
+                        "Run manually: python scripts/download_model.py"
+                    )
+                    return
 
             # ONNX session with all graph-level optimisations on CPU
             sess_options = ort.SessionOptions()

@@ -1,8 +1,8 @@
-> **📖 [Full Documentation](https://cachorro.space/mcp-memory/getting-started/)** — guides, API reference, architecture, and more at cachorro.space
+> **📖 [Full Documentation](https://cachorro.space/mcp-memory/getting-started/)** — guides, tools reference, architecture, and maintenance at cachorro.space
 
 # mcp-memory
 
-A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) — with SQLite persistence, vector embeddings, semantic search, and **🧠 Limbic Scoring** for dynamic ranking.
+A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) — with SQLite persistence, vector embeddings, semantic search, and **Limbic Scoring** for dynamic ranking.
 
 **Why?** The original server writes the entire knowledge graph to a JSONL file on every operation, with no locking or atomic writes. Under concurrent access (multiple MCP clients), this causes data corruption. This server replaces that with a proper SQLite database.
 
@@ -12,7 +12,11 @@ A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com
 - **SQLite + WAL** — safe concurrent access, no more corrupted JSONL
 - **Semantic search** via sqlite-vec + ONNX embeddings (94+ languages)
 - **Hybrid search** (FTS5 + KNN) — combines full-text BM25 and semantic vector search via Reciprocal Rank Fusion. Finds entities by exact terms or semantic similarity — or both at once.
-- **🧠 Limbic Scoring** — dynamic re-ranking with salience, temporal decay, co-occurrence signals, and hybrid search scores. Transparent to the API.
+- **Limbic Scoring** — dynamic re-ranking with salience, temporal decay, co-occurrence signals, and hybrid search scores. Transparent to the API.
+- **Semantic deduplication** — automatic `similarity_flag` on new observations when cosine similarity >= 0.85 (with containment scoring for asymmetric text lengths)
+- **Consolidation reports** — read-only health checks for split candidates, flagged observations, stale entities, and large entities
+- **Improved recency decay** — `entity_access_log` tracking with `ALPHA_CONS=0.2` multi-day consolidation signal
+- **Containment fix** — proper handling of asymmetric text lengths (ratio >= 2.0) in deduplication scoring
 - **Lightweight** — ~500 MB total vs ~1.4 GB for similar solutions
 - **Migration** — one-click import from Anthropic's JSONL format
 - **Zero config** — works out of the box, optional model download for semantic search
@@ -69,25 +73,36 @@ print(result)
 
 ## MCP Tools
 
-### Compatible with Anthropic (8 tools)
+### Core (Anthropic-compatible)
 
 | Tool | Description |
 |------|-------------|
 | `create_entities` | Create or update entities (merges observations on conflict) |
 | `create_relations` | Create typed relations between entities |
-| `add_observations` | Add observations to an existing entity |
+| `add_observations` | Add observations to an existing entity (with automatic similarity flagging) |
 | `delete_entities` | Delete entities (cascades to observations + relations) |
 | `delete_observations` | Delete specific observations |
 | `delete_relations` | Delete specific relations |
 | `search_nodes` | Search by substring (name, type, observation content) |
 | `open_nodes` | Retrieve entities by name |
 
-### New tools (2)
+### Search & Analysis
 
 | Tool | Description |
 |------|-------------|
-| `search_semantic` | Semantic search via vector embeddings (cosine similarity) with **Limbic Scoring** re-ranking |
+| `search_semantic` | Semantic search via vector embeddings with **Limbic Scoring** re-ranking |
+| `find_duplicate_observations` | Find semantically duplicated observations within an entity (cosine + containment) |
+| `consolidation_report` | Generate a read-only consolidation report (split candidates, flagged obs, stale entities) |
+
+### Entity Management
+
+| Tool | Description |
+|------|-------------|
 | `migrate` | Import from Anthropic's JSONL format (idempotent) |
+| `analyze_entity_split` | Analyze if an entity needs splitting (TF-IDF topic grouping) |
+| `propose_entity_split_tool` | Propose a split with suggested entity names and relations |
+| `execute_entity_split_tool` | Execute an approved split (atomic transaction) |
+| `find_split_candidates` | Find all entities that need splitting |
 
 ## Architecture
 
@@ -96,8 +111,8 @@ server.py (FastMCP)  ←→  storage.py (SQLite + sqlite-vec + FTS5)
                               ↑
                         embeddings.py (ONNX Runtime)
                               ↑
-                        intfloat/multilingual-e5-small
-                        (384d, 94+ languages, asymmetric retrieval)
+                        sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+                        (384d, multilingual, cosine similarity)
                               ↑
                         scoring.py (Limbic Scoring + RRF)
                         salience · temporal decay · co-occurrence
@@ -118,7 +133,7 @@ Each entity gets an embedding vector generated from its text using a **Head+Tail
 
 When you call `search_semantic`, the pipeline runs in parallel:
 
-1. **Semantic (KNN)** — the query is encoded with the `"query: "` prefix and compared against entity vectors via `sqlite-vec`
+1. **Semantic (KNN)** — the query is encoded and compared against entity vectors via `sqlite-vec`
 2. **Full-text (FTS5)** — the query is searched against a BM25 index covering names, types, and observation content
 3. **Merge (RRF)** — results from both branches are combined using Reciprocal Rank Fusion (`score(d) = Σ 1/(k + rank)`)
 
@@ -131,6 +146,14 @@ The merged candidates are then re-ranked by the **Limbic Scoring** engine, which
 The output includes `limbic_score`, `scoring` (importance/temporal/cooc breakdown), and optionally `rrf_score` when FTS5 contributes results.
 
 > **For full technical details**, see [DOCUMENTATION.md](docs/DOCUMENTATION.md) — includes the scoring formula, RRF constants, schema DDL, and architecture diagrams.
+
+## Testing
+
+```bash
+uv run pytest tests/ -v
+```
+
+79+ tests covering all tools, embeddings, scoring, and edge cases. Zero regressions.
 
 ## Requirements
 
