@@ -5,6 +5,7 @@ Transparent to the external API — same output format as plain KNN."""
 
 import logging
 import math
+import string
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -40,6 +41,83 @@ GAMMA = (
 EXPANSION_FACTOR = 3  # KNN over-retrieval factor
 TEMPORAL_FLOOR = 0.1  # Temporal decay never drops below this (knowledge degrades but isn't destroyed)
 RRF_K = 60  # RRF constant (default from original paper)
+
+# Containment dedup constants
+CONTAINMENT_THRESHOLD = 0.7  # % of tokens in shorter that must appear in longer
+LENGTH_RATIO_THRESHOLD = (
+    2.0  # One string must be 2x+ longer than other to activate containment
+)
+
+
+# ------------------------------------------------------------------
+# Containment dedup helpers
+# ------------------------------------------------------------------
+
+
+def _tokenize(text: str) -> set[str]:
+    """Tokenize text into a set of lowercase words, stripping punctuation."""
+    return {
+        word.strip(string.punctuation)
+        for word in text.lower().split()
+        if word and word.strip(string.punctuation)
+    }
+
+
+def compute_containment(shorter: str, longer: str) -> float:
+    """Compute token containment ratio: % of tokens in shorter that appear in longer.
+
+    containment(s, l) = |tokens(s) ∩ tokens(l)| / |tokens(s)|
+
+    Returns 0.0 to 1.0. Returns 1.0 if shorter is empty or all tokens match.
+    """
+    if not shorter.strip():
+        return 1.0
+
+    shorter_tokens = _tokenize(shorter)
+    longer_tokens = _tokenize(longer)
+
+    if not shorter_tokens:
+        return 1.0
+
+    overlap = shorter_tokens & longer_tokens
+    return len(overlap) / len(shorter_tokens)
+
+
+def combined_similarity(
+    cosine_sim: float,
+    text_a: str,
+    text_b: str,
+    cosine_threshold: float = 0.85,
+    containment_threshold: float = CONTAINMENT_THRESHOLD,
+    length_ratio_threshold: float = LENGTH_RATIO_THRESHOLD,
+) -> bool:
+    """Determine if two texts are duplicates using cosine + containment.
+
+    Returns True if:
+    - cosine_sim >= cosine_threshold (existing behavior), OR
+    - containment_ratio >= containment_threshold AND length ratio is asymmetric (>= length_ratio_threshold)
+
+    The containment signal only activates when one text is significantly longer
+    than the other, avoiding false positives between texts of similar length.
+    """
+    # Path 1: existing cosine behavior
+    if cosine_sim >= cosine_threshold:
+        return True
+
+    # Path 2: containment for asymmetric length pairs
+    len_a = len(text_a)
+    len_b = len(text_b)
+    min_len = max(min(len_a, len_b), 1)
+    max_len = max(len_a, len_b)
+    length_ratio = max_len / min_len
+
+    if length_ratio >= length_ratio_threshold:
+        shorter, longer = (text_a, text_b) if len_a <= len_b else (text_b, text_a)
+        containment = compute_containment(shorter, longer)
+        if containment >= containment_threshold:
+            return True
+
+    return False
 
 
 # ------------------------------------------------------------------

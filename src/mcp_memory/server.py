@@ -885,11 +885,13 @@ def find_split_candidates() -> dict[str, Any]:
 # ============================================================
 @mcp.tool
 def find_duplicate_observations(
-    entity_name: str, threshold: float = 0.85
+    entity_name: str, threshold: float = 0.85, containment_threshold: float = 0.7
 ) -> dict[str, Any]:
     """Find observations that may be semantically duplicated within an entity.
     Returns pairs of observations with similarity score above threshold.
-    Use this to review and consolidate redundant observations."""
+    Use this to review and consolidate redundant observations.
+    Uses combined similarity: cosine >= threshold OR containment >= containment_threshold
+    when texts have asymmetric length (one is 2x+ longer than the other)."""
     try:
         # 1. Find entity
         entity = store.get_entity_by_name(entity_name)
@@ -913,16 +915,19 @@ def find_duplicate_observations(
                 "Run 'python scripts/download_model.py' to download the model first.",
             }
 
-        # 4. Encode all observations (single batch)
+        # 4. Import combined_similarity once (not inside loop)
+        from mcp_memory.scoring import combined_similarity
+
+        # 5. Encode all observations (single batch)
         contents = [o["content"] for o in observations]
         embeddings = engine.encode(contents)  # (n, 384)
 
-        # 5. Pairwise cosine similarities (L2-normalised → dot product)
+        # 6. Pairwise cosine similarities (L2-normalised → dot product)
         import numpy as np
 
         sim_matrix = embeddings @ embeddings.T  # (n, n)
 
-        # 6. Union-Find for clustering above threshold
+        # 7. Union-Find for clustering above threshold
         n = len(observations)
         parent = list(range(n))
 
@@ -941,7 +946,16 @@ def find_duplicate_observations(
         for i in range(n):
             for j in range(i + 1, n):
                 sim = float(sim_matrix[i][j])
-                if sim >= threshold:
+                if combined_similarity(
+                    sim,
+                    contents[i],
+                    contents[j],
+                    cosine_threshold=threshold,
+                    containment_threshold=containment_threshold,
+                ):
+                    # Determine effective similarity score for display
+                    # If cosine alone didn't pass, show containment-based match
+                    effective_score = sim
                     pairs.append(
                         {
                             "observation_a": {
@@ -954,12 +968,15 @@ def find_duplicate_observations(
                                 "content": observations[j]["content"],
                                 "similarity_flag": observations[j]["similarity_flag"],
                             },
-                            "similarity_score": round(sim, 4),
+                            "similarity_score": round(effective_score, 4),
+                            "match_type": (
+                                "cosine" if sim >= threshold else "containment"
+                            ),
                         }
                     )
                     union(i, j)
 
-        # 7. Build clusters from union-find
+        # 8. Build clusters from union-find
         clusters_map: dict[int, list[dict[str, Any]]] = {}
         for idx in range(n):
             root = find(idx)

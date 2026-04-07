@@ -446,7 +446,18 @@ class MemoryStore:
                         float(np.max(similarities)) if len(similarities) > 0 else 0.0
                     )
 
-                    flag = 1 if max_sim >= 0.85 else 0
+                    # Find the index of the most similar existing observation
+                    max_idx = (
+                        int(np.argmax(similarities)) if len(similarities) > 0 else 0
+                    )
+                    best_existing = existing_obs[max_idx] if existing_obs else ""
+
+                    # Combined similarity: cosine OR containment for asymmetric pairs
+                    from mcp_memory.scoring import combined_similarity
+
+                    flag = (
+                        1 if combined_similarity(max_sim, content, best_existing) else 0
+                    )
 
                     self.db.execute(
                         "INSERT INTO observations (entity_id, content, similarity_flag) "
