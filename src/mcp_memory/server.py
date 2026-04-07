@@ -517,6 +517,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
         access_data = store.get_access_data(candidate_ids)
         degree_data = store.get_entity_degrees(candidate_ids)
         cooc_data = store.get_co_occurrences(candidate_ids)
+        access_days_data = store.get_access_days(candidate_ids)
 
         entity_created: dict[int, str] = {}
         for eid in candidate_ids:
@@ -557,6 +558,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         cooc_data=cooc_data,
                         entity_created=entity_created,
                         limit=limit,
+                        access_days_data=access_days_data,
                     )
                 else:
                     ranked = rank_candidates(
@@ -566,6 +568,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         cooc_data=cooc_data,
                         entity_created=entity_created,
                         limit=limit,
+                        access_days_data=access_days_data,
                     )
             elif routing_strategy in (
                 RoutingStrategy.COSINE_HEAVY,
@@ -581,6 +584,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         entity_created=entity_created,
                         limit=limit,
                         strategy=routing_strategy,
+                        access_days_data=access_days_data,
                     )
                 else:
                     # For pure semantic, wrap knn_results in format expected
@@ -600,6 +604,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         entity_created=entity_created,
                         limit=limit,
                         strategy=routing_strategy,
+                        access_days_data=access_days_data,
                     )
             else:
                 # Fallback (shouldn't happen): use original limbic scoring
@@ -611,6 +616,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         cooc_data=cooc_data,
                         entity_created=entity_created,
                         limit=limit,
+                        access_days_data=access_days_data,
                     )
                 else:
                     ranked = rank_candidates(
@@ -620,6 +626,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         cooc_data=cooc_data,
                         entity_created=entity_created,
                         limit=limit,
+                        access_days_data=access_days_data,
                     )
 
         # --- Build output based on treatment ---

@@ -28,6 +28,7 @@ class RoutingStrategy(Enum):
 
 BETA_SAL = 0.5  # Salience boost factor
 BETA_DEG = 0.15  # Degree weight
+ALPHA_CONS = 0.2  # Consolidation weight (multi-day access signal)
 D_MAX = 15  # Degree cap
 LAMBDA_HOURLY = 0.0001  # Decay rate per hour (half-life ~290 days)
 COOC_TEMPORAL_FLOOR = (
@@ -72,11 +73,19 @@ def compute_importance(
     access_count: int,
     max_access: int,
     degree: int,
+    access_days: int = 1,
+    max_access_days: int = 1,
 ) -> float:
-    """Compute structural importance (SIN temporal).
+    """Compute structural importance with consolidation signal.
 
     importance(e) = [log2(1 + access_count) / log2(1 + max_access)]
                   × (1 + β_deg × min(degree, D_max) / D_max)
+                  × (1 + α_cons × consolidation(e))
+
+    where consolidation(e) = log2(1 + access_days) / log2(1 + max_access_days).
+
+    When max_access_days <= 1, consolidation = 0 and the multiplier is 1.0
+    (identical to pre-consolidation scoring — retrocompatible).
 
     When max_access == 0, returns 0.0 (no access data → neutral).
     """
@@ -85,7 +94,15 @@ def compute_importance(
 
     access_norm = math.log2(1 + access_count) / math.log2(1 + max_access)
     degree_norm = min(degree, D_MAX) / D_MAX
-    return access_norm * (1 + BETA_DEG * degree_norm)
+
+    # Consolidation factor: neutral when max_access_days <= 1
+    if max_access_days > 1:
+        consolidation = math.log2(1 + access_days) / math.log2(1 + max_access_days)
+        cons_multiplier = 1 + ALPHA_CONS * consolidation
+    else:
+        cons_multiplier = 1.0
+
+    return access_norm * (1 + BETA_DEG * degree_norm) * cons_multiplier
 
 
 def compute_temporal_factor(last_access_str: str, created_at_str: str) -> float:
@@ -202,6 +219,7 @@ def rank_candidates(
     limit: int,
     gamma: float | None = None,
     beta_sal: float | None = None,
+    access_days_data: dict[int, int] | None = None,
 ) -> list[dict]:
     """Re-rank KNN candidates using Opción B scoring.
 
@@ -217,6 +235,8 @@ def rank_candidates(
         cooc_data: {(id_a, id_b): {"co_count": int, "last_co": str}}.
         entity_created: {entity_id: created_at_str}.
         limit: Number of results to return (top-K).
+        access_days_data: {entity_id: access_days_count}. Optional consolidation signal.
+            When empty/None, scoring is identical to pre-consolidation behavior.
 
     Returns:
         Top-K candidates sorted by limbic score (descending).
@@ -224,6 +244,9 @@ def rank_candidates(
     """
     if not knn_results:
         return []
+
+    _access_days_data = access_days_data or {}
+    _max_access_days = max(_access_days_data.values(), default=1)
 
     # Compute max_access for normalization
     max_access = max(
@@ -245,12 +268,14 @@ def rank_candidates(
         # 1. Cosine similarity (distance from sqlite-vec cosine)
         cosine_sim = max(0.0, 1.0 - distance)
 
-        # 2. Importance
+        # 2. Importance (with consolidation signal)
         ad = access_data.get(eid, {})
         importance = compute_importance(
             access_count=ad.get("access_count", 0),
             max_access=max_access,
             degree=degree_data.get(eid, 0),
+            access_days=_access_days_data.get(eid, 1),
+            max_access_days=_max_access_days,
         )
 
         # 3. Temporal factor
@@ -296,6 +321,7 @@ def rank_hybrid_candidates(
     limit: int,
     gamma: float | None = None,
     beta_sal: float | None = None,
+    access_days_data: dict[int, int] | None = None,
 ) -> list[dict]:
     """Re-rank RRF-merged candidates using limbic scoring.
 
@@ -320,6 +346,7 @@ def rank_hybrid_candidates(
         cooc_data: {(id_a, id_b): {"co_count": int, "last_co": str}}.
         entity_created: {entity_id: created_at_str}.
         limit: Number of results to return (top-K).
+        access_days_data: {entity_id: access_days_count}. Optional consolidation signal.
 
     Returns:
         Top-K candidates sorted by limbic_score (descending).
@@ -328,6 +355,9 @@ def rank_hybrid_candidates(
     """
     if not merged_results:
         return []
+
+    _access_days_data = access_days_data or {}
+    _max_access_days = max(_access_days_data.values(), default=1)
 
     # Normalize RRF scores to [0, 1] for FTS-only entities
     rrf_values = [r["rrf_score"] for r in merged_results]
@@ -362,12 +392,14 @@ def rank_hybrid_candidates(
             norm_rrf = (rrf_score - rrf_min) / rrf_range
             base_relevance = 0.2 + 0.6 * norm_rrf
 
-        # 2. Importance
+        # 2. Importance (with consolidation signal)
         ad = access_data.get(eid, {})
         importance = compute_importance(
             access_count=ad.get("access_count", 0),
             max_access=max_access,
             degree=degree_data.get(eid, 0),
+            access_days=_access_days_data.get(eid, 1),
+            max_access_days=_max_access_days,
         )
 
         # 3. Temporal factor
@@ -494,6 +526,7 @@ def rank_with_routing_strategy(
     strategy: RoutingStrategy,
     gamma: float | None = None,
     beta_sal: float | None = None,
+    access_days_data: dict[int, int] | None = None,
 ) -> list[dict]:
     """Re-rank merged candidates using a specified routing strategy.
 
@@ -514,6 +547,7 @@ def rank_with_routing_strategy(
         entity_created: {entity_id: created_at_str}.
         limit: Number of results to return (top-K).
         strategy: RoutingStrategy enum value.
+        access_days_data: {entity_id: access_days_count}. Optional consolidation signal.
 
     Returns:
         Top-K candidates sorted by final_score (descending).
@@ -532,6 +566,7 @@ def rank_with_routing_strategy(
         limit=limit,
         gamma=gamma,
         beta_sal=beta_sal,
+        access_days_data=access_days_data,
     )
 
     # Step 2: Collect cosine and limbic values for normalization

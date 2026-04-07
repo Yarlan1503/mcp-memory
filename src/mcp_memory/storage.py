@@ -234,6 +234,22 @@ class MemoryStore:
 
         # --- Idempotent migrations ---
         self._add_similarity_flag_column()
+        self._add_entity_access_log_table()
+
+    def _add_entity_access_log_table(self) -> None:
+        """Idempotent migration: create entity_access_log table for day-level access tracking."""
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_access_log (
+                entity_id    INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                access_date  TEXT    NOT NULL,
+                access_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (entity_id, access_date)
+            );
+            """
+        )
+        self.db.commit()
+        logger.info("entity_access_log table verified.")
 
     def _add_similarity_flag_column(self) -> None:
         """Idempotent migration: add similarity_flag column to observations if missing."""
@@ -699,7 +715,10 @@ class MemoryStore:
         self.db.commit()
 
     def record_access(self, entity_id: int) -> None:
-        """Record an access event: increment count and update last_access."""
+        """Record an access event: increment count and update last_access.
+
+        Also records a daily entry in entity_access_log for consolidation tracking.
+        """
         self.db.execute(
             """
             INSERT INTO entity_access (entity_id, access_count, last_access)
@@ -707,6 +726,15 @@ class MemoryStore:
             ON CONFLICT(entity_id) DO UPDATE SET
                 access_count = access_count + 1,
                 last_access = datetime('now')
+            """,
+            (entity_id,),
+        )
+        self.db.execute(
+            """
+            INSERT INTO entity_access_log (entity_id, access_date, access_count)
+            VALUES (?, DATE('now'), 1)
+            ON CONFLICT(entity_id, access_date) DO UPDATE SET
+                access_count = access_count + 1
             """,
             (entity_id,),
         )
@@ -737,6 +765,27 @@ class MemoryStore:
             }
             for r in rows
         }
+
+    def get_access_days(self, entity_ids: list[int]) -> dict[int, int]:
+        """Get count of unique days with access for each entity.
+
+        Returns {entity_id: access_days_count}.
+        Entities with no rows in entity_access_log (pre-migration accesses)
+        are not included in the result — callers should default to 1.
+        """
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"""
+            SELECT entity_id, COUNT(*) as access_days
+            FROM entity_access_log
+            WHERE entity_id IN ({placeholders})
+            GROUP BY entity_id
+            """,
+            entity_ids,
+        ).fetchall()
+        return {r["entity_id"]: r["access_days"] for r in rows}
 
     def get_entity_degrees(self, entity_ids: list[int]) -> dict[int, int]:
         """Get relation degree count for a list of entity IDs.
