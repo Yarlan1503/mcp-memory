@@ -873,6 +873,118 @@ def find_split_candidates() -> dict[str, Any]:
 
 
 # ============================================================
+# TOOL 16: find_duplicate_observations
+# ============================================================
+@mcp.tool
+def find_duplicate_observations(
+    entity_name: str, threshold: float = 0.85
+) -> dict[str, Any]:
+    """Find observations that may be semantically duplicated within an entity.
+    Returns pairs of observations with similarity score above threshold.
+    Use this to review and consolidate redundant observations."""
+    try:
+        # 1. Find entity
+        entity = store.get_entity_by_name(entity_name)
+        if not entity:
+            return {"error": f"Entity not found: {entity_name}"}
+
+        # 2. Get observations with metadata
+        observations = store.get_observations_with_ids(entity["id"])
+        if len(observations) < 2:
+            return {
+                "entity": entity_name,
+                "total_observations": len(observations),
+                "clusters": [],
+            }
+
+        # 3. Get embedding engine
+        engine = _get_engine()
+        if not engine or not engine.available:
+            return {
+                "error": "Embedding model not available. "
+                "Run 'python scripts/download_model.py' to download the model first.",
+            }
+
+        # 4. Encode all observations (single batch)
+        contents = [o["content"] for o in observations]
+        embeddings = engine.encode(contents)  # (n, 384)
+
+        # 5. Pairwise cosine similarities (L2-normalised → dot product)
+        import numpy as np
+
+        sim_matrix = embeddings @ embeddings.T  # (n, n)
+
+        # 6. Union-Find for clustering above threshold
+        n = len(observations)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        pairs: list[dict[str, Any]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = float(sim_matrix[i][j])
+                if sim >= threshold:
+                    pairs.append(
+                        {
+                            "observation_a": {
+                                "id": observations[i]["id"],
+                                "content": observations[i]["content"],
+                                "similarity_flag": observations[i]["similarity_flag"],
+                            },
+                            "observation_b": {
+                                "id": observations[j]["id"],
+                                "content": observations[j]["content"],
+                                "similarity_flag": observations[j]["similarity_flag"],
+                            },
+                            "similarity_score": round(sim, 4),
+                        }
+                    )
+                    union(i, j)
+
+        # 7. Build clusters from union-find
+        clusters_map: dict[int, list[dict[str, Any]]] = {}
+        for idx in range(n):
+            root = find(idx)
+            if root not in clusters_map:
+                clusters_map[root] = []
+            clusters_map[root].append(
+                {
+                    "observation_id": observations[idx]["id"],
+                    "content": observations[idx]["content"],
+                    "similarity_flag": observations[idx]["similarity_flag"],
+                }
+            )
+
+        # Only keep clusters with 2+ members (actual duplicates)
+        clusters = [
+            {"observations": members, "size": len(members)}
+            for members in clusters_map.values()
+            if len(members) > 1
+        ]
+
+        return {
+            "entity": entity_name,
+            "total_observations": n,
+            "duplicates_found": len(pairs),
+            "clusters": clusters,
+        }
+
+    except Exception as e:
+        logger.error("Error in find_duplicate_observations: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
 # Main entry point
 # ============================================================
 def main() -> None:

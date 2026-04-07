@@ -71,6 +71,22 @@ class MemoryStore:
         self.db.close()
 
     # ------------------------------------------------------------------
+    # Embedding engine helper
+    # ------------------------------------------------------------------
+
+    def _get_embedding_engine(self):
+        """Get embedding engine instance (best-effort). Returns None if unavailable."""
+        try:
+            from mcp_memory.embeddings import EmbeddingEngine
+
+            engine = EmbeddingEngine.get_instance()
+            if engine and engine.available:
+                return engine
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
     # Schema initialisation
     # ------------------------------------------------------------------
 
@@ -216,6 +232,24 @@ class MemoryStore:
 
         self.db.commit()
 
+        # --- Idempotent migrations ---
+        self._add_similarity_flag_column()
+
+    def _add_similarity_flag_column(self) -> None:
+        """Idempotent migration: add similarity_flag column to observations if missing."""
+        try:
+            cols = self.db.execute("PRAGMA table_info(observations)").fetchall()
+            col_names = {c["name"] for c in cols}
+            if "similarity_flag" not in col_names:
+                self.db.execute(
+                    "ALTER TABLE observations ADD COLUMN similarity_flag "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                self.db.commit()
+                logger.info("Added similarity_flag column to observations table.")
+        except Exception as exc:
+            logger.warning("Failed to add similarity_flag column: %s", exc)
+
     # ------------------------------------------------------------------
     # Entity CRUD
     # ------------------------------------------------------------------
@@ -358,21 +392,87 @@ class MemoryStore:
 
     def add_observations(self, entity_id: int, observations: list[str]) -> int:
         """INSERT multiple observations. Returns count inserted.
-        Skips duplicates (same content for same entity)."""
+        Skips duplicates (same content for same entity).
+        Observations semantically similar to existing ones (cosine >= 0.85)
+        are inserted with similarity_flag=1 for later review."""
+        if not observations:
+            return 0
+
         inserted = 0
-        for content in observations:
-            # Skip duplicates
-            existing = self.db.execute(
-                "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
-                (entity_id, content),
-            ).fetchone()
-            if existing:
-                continue
-            self.db.execute(
-                "INSERT INTO observations (entity_id, content) VALUES (?, ?)",
-                (entity_id, content),
-            )
-            inserted += 1
+
+        # Try to get embedding engine for semantic dedup
+        engine = self._get_embedding_engine()
+        existing_obs = self.get_observations(entity_id)
+
+        if existing_obs and engine is not None:
+            # --- Semantic dedup path ---
+            try:
+                import numpy as np  # noqa: F401
+
+                # Batch encode all existing observations
+                existing_embeddings = engine.encode(existing_obs)
+
+                for content in observations:
+                    # Skip exact duplicates
+                    exact = self.db.execute(
+                        "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
+                        (entity_id, content),
+                    ).fetchone()
+                    if exact:
+                        continue
+
+                    # Encode the new observation
+                    new_embedding = engine.encode([content])  # (1, 384)
+
+                    # Cosine similarity with all existing (L2-normalised → dot product)
+                    similarities = existing_embeddings @ new_embedding[0]  # (n,)
+                    max_sim = (
+                        float(np.max(similarities)) if len(similarities) > 0 else 0.0
+                    )
+
+                    flag = 1 if max_sim >= 0.85 else 0
+
+                    self.db.execute(
+                        "INSERT INTO observations (entity_id, content, similarity_flag) "
+                        "VALUES (?, ?, ?)",
+                        (entity_id, content, flag),
+                    )
+                    inserted += 1
+
+            except Exception as exc:
+                logger.warning(
+                    "Semantic dedup failed, falling back to normal insert: %s", exc
+                )
+                # Fallback: insert remaining without flag
+                for content in observations:
+                    exact = self.db.execute(
+                        "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
+                        (entity_id, content),
+                    ).fetchone()
+                    if exact:
+                        continue
+                    self.db.execute(
+                        "INSERT INTO observations (entity_id, content, similarity_flag) "
+                        "VALUES (?, ?, 0)",
+                        (entity_id, content),
+                    )
+                    inserted += 1
+        else:
+            # --- Normal path: no engine or no existing observations ---
+            for content in observations:
+                exact = self.db.execute(
+                    "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
+                    (entity_id, content),
+                ).fetchone()
+                if exact:
+                    continue
+                self.db.execute(
+                    "INSERT INTO observations (entity_id, content, similarity_flag) "
+                    "VALUES (?, ?, 0)",
+                    (entity_id, content),
+                )
+                inserted += 1
+
         if inserted:
             self.db.commit()
             self._sync_fts(entity_id)
@@ -385,6 +485,22 @@ class MemoryStore:
             (entity_id,),
         ).fetchall()
         return [r["content"] for r in rows]
+
+    def get_observations_with_ids(self, entity_id: int) -> list[dict]:
+        """All observations for an entity with id, content, and similarity_flag."""
+        rows = self.db.execute(
+            "SELECT id, content, similarity_flag FROM observations "
+            "WHERE entity_id = ? ORDER BY id",
+            (entity_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "content": r["content"],
+                "similarity_flag": r["similarity_flag"],
+            }
+            for r in rows
+        ]
 
     def delete_observations(self, entity_id: int, observations: list[str]) -> int:
         """DELETE by exact content match. Returns count deleted."""
