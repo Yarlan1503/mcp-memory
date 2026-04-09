@@ -287,3 +287,284 @@ class TestOpenNodesReflections:
         assert len(entities) == 1
         assert "reflections" in entities[0]
         assert len(entities[0]["reflections"]) == 0
+
+
+# ============================================================
+# 7. end_relation MCP tool tests
+# ============================================================
+
+
+class TestEndRelationTool:
+    """Tests for the end_relation MCP tool."""
+
+    def test_end_relation_active(self, store_with_schema, monkeypatch):
+        """Expiring an active relation sets active=0 and ended_at."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import end_relation
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        e1 = store_with_schema.upsert_entity("Alpha", "T")
+        e2 = store_with_schema.upsert_entity("Beta", "T")
+        store_with_schema.create_relation(e1, e2, "producido_por")
+
+        rel_row = store_with_schema.db.execute(
+            "SELECT id FROM relations WHERE from_entity = ? AND to_entity = ?",
+            (e1, e2),
+        ).fetchone()
+        rel_id = rel_row["id"]
+
+        result = end_relation(rel_id)
+        assert "error" not in result
+        assert "relation" in result
+        assert result["relation"]["active"] is False
+        assert result["relation"]["ended_at"] is not None
+        assert result["relation"]["from"] == "Alpha"
+        assert result["relation"]["to"] == "Beta"
+        assert result["relation"]["relation_type"] == "producido_por"
+
+    def test_end_relation_already_inactive(self, store_with_schema, monkeypatch):
+        """Expiring an already-inactive relation returns notice, not error."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import end_relation
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        e1 = store_with_schema.upsert_entity("X", "T")
+        e2 = store_with_schema.upsert_entity("Y", "T")
+        store_with_schema.create_relation(e1, e2, "test_type")
+
+        rel_row = store_with_schema.db.execute(
+            "SELECT id FROM relations WHERE from_entity = ? AND to_entity = ?",
+            (e1, e2),
+        ).fetchone()
+        rel_id = rel_row["id"]
+
+        # Expire once
+        result1 = end_relation(rel_id)
+        assert "error" not in result1
+
+        # Expire again — should get notice
+        result2 = end_relation(rel_id)
+        assert "error" not in result2
+        assert "notice" in result2
+        assert "already inactive" in result2["notice"].lower()
+
+    def test_end_relation_with_inverse(self, store_with_schema, monkeypatch):
+        """Expiring contiene also expires the parte_de inverse."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import end_relation
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        e1 = store_with_schema.upsert_entity("Parent", "T")
+        e2 = store_with_schema.upsert_entity("Child", "T")
+        store_with_schema.create_relation(e1, e2, "contiene")
+
+        # Find the contiene relation
+        contiene_row = store_with_schema.db.execute(
+            "SELECT id FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = 'contiene'",
+            (e1, e2),
+        ).fetchone()
+        contiene_id = contiene_row["id"]
+
+        # Find the parte_de inverse
+        parte_de_row = store_with_schema.db.execute(
+            "SELECT id, active FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = 'parte_de'",
+            (e2, e1),
+        ).fetchone()
+        assert parte_de_row is not None
+        parte_de_id = parte_de_row["id"]
+
+        # Expire the contiene
+        result = end_relation(contiene_id)
+        assert "error" not in result
+        assert "inverse_expired_id" in result
+        assert result["inverse_expired_id"] == parte_de_id
+
+        # Verify both are now inactive
+        check_contiene = store_with_schema.db.execute(
+            "SELECT active, ended_at FROM relations WHERE id = ?", (contiene_id,)
+        ).fetchone()
+        assert check_contiene["active"] == 0
+        assert check_contiene["ended_at"] is not None
+
+        check_parte = store_with_schema.db.execute(
+            "SELECT active, ended_at FROM relations WHERE id = ?", (parte_de_id,)
+        ).fetchone()
+        assert check_parte["active"] == 0
+        assert check_parte["ended_at"] is not None
+
+    def test_end_relation_not_found(self, store_with_schema, monkeypatch):
+        """Expiring a non-existent relation ID returns error."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import end_relation
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        result = end_relation(99999)
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+
+# ============================================================
+# 8. search_reflections recency scoring
+# ============================================================
+
+
+class TestSearchReflectionsRecency:
+    """Tests for recency scoring in search_reflections."""
+
+    def test_recent_reflection_ranks_higher(self, store_with_schema, monkeypatch):
+        """A newer reflection ranks higher than an older one for the same query."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import search_reflections
+        from mcp_memory.embeddings import EmbeddingEngine
+
+        engine = EmbeddingEngine.get_instance()
+        if not engine or not engine.available:
+            pytest.skip("Embedding model not available")
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        # Create two reflections with similar content but different timestamps
+        # Old reflection — set created_at to 1 year ago
+        old = store_with_schema.add_reflection(
+            "global",
+            None,
+            "nolan",
+            "El sistema de memoria artificial es fundamental para la inteligencia",
+            "insight",
+        )
+        # Manually set created_at to 1 year ago
+        store_with_schema.db.execute(
+            "UPDATE reflections SET created_at = datetime('now', '-365 days') WHERE id = ?",
+            (old["id"],),
+        )
+        store_with_schema.db.commit()
+
+        # Recent reflection — just created (now)
+        recent = store_with_schema.add_reflection(
+            "global",
+            None,
+            "sofia",
+            "El sistema de memoria artificial es clave para la inteligencia",
+        )
+
+        result = search_reflections("memoria artificial inteligencia")
+        assert "error" not in result
+        assert len(result["results"]) >= 2
+
+        # The recent one should rank first (higher score due to recency)
+        ids = [r["id"] for r in result["results"]]
+        assert recent["id"] in ids
+        assert old["id"] in ids
+
+        # Find scores
+        scores = {r["id"]: r["score"] for r in result["results"]}
+        assert scores[recent["id"]] > scores[old["id"]]
+
+    def test_same_day_reflections_similar_score(self, store_with_schema, monkeypatch):
+        """Reflections created on the same day have very similar recency scores."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import search_reflections
+        from mcp_memory.embeddings import EmbeddingEngine
+
+        engine = EmbeddingEngine.get_instance()
+        if not engine or not engine.available:
+            pytest.skip("Embedding model not available")
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        # Create two reflections with identical timestamps
+        r1 = store_with_schema.add_reflection(
+            "global", None, "nolan", "La paciencia es una virtud del programador"
+        )
+        r2 = store_with_schema.add_reflection(
+            "global", None, "sofia", "La paciencia del programador es admirable"
+        )
+
+        result = search_reflections("paciencia programador")
+        assert "error" not in result
+        assert len(result["results"]) >= 2
+
+        # Both should be present and have similar scores
+        scores = {r["id"]: r["score"] for r in result["results"]}
+        if r1["id"] in scores and r2["id"] in scores:
+            # Scores should be within 1% of each other (same hour essentially)
+            ratio = min(scores[r1["id"]], scores[r2["id"]]) / max(
+                scores[r1["id"]], scores[r2["id"]]
+            )
+            assert ratio > 0.99, f"Same-day scores too different: {scores}"
+
+    def test_search_reflections_no_results(self, store_with_schema, monkeypatch):
+        """Search with no matching reflections returns empty results."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import search_reflections
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        result = search_reflections("xyznonexistent12345")
+        assert "error" not in result
+        assert result["results"] == []
+
+
+# ============================================================
+# 9. Backward compatibility
+# ============================================================
+
+
+class TestBackwardCompatibility:
+    """Ensure existing functionality still works after changes."""
+
+    def test_search_reflections_basic_functionality(
+        self, store_with_schema, monkeypatch
+    ):
+        """search_reflections still works with basic query after changes."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import search_reflections
+        from mcp_memory.embeddings import EmbeddingEngine
+
+        engine = EmbeddingEngine.get_instance()
+        if not engine or not engine.available:
+            pytest.skip("Embedding model not available")
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        # Add a reflection
+        store_with_schema.add_reflection(
+            "global", None, "nolan", "Las pruebas son la base del software confiable"
+        )
+
+        result = search_reflections("pruebas software")
+        assert "error" not in result
+        assert len(result["results"]) >= 1
+        assert "score" in result["results"][0]
+        assert "created_at" in result["results"][0]
+
+    def test_preexisting_reflections_searchable(self, store_with_schema, monkeypatch):
+        """Reflections created before the recency change are still searchable."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import search_reflections
+        from mcp_memory.embeddings import EmbeddingEngine
+
+        engine = EmbeddingEngine.get_instance()
+        if not engine or not engine.available:
+            pytest.skip("Embedding model not available")
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        # Create a reflection and set its timestamp to long ago
+        ref = store_with_schema.add_reflection(
+            "global", None, "sofia", "La retrocompatibilidad es esencial"
+        )
+        store_with_schema.db.execute(
+            "UPDATE reflections SET created_at = datetime('now', '-180 days') WHERE id = ?",
+            (ref["id"],),
+        )
+        store_with_schema.db.commit()
+
+        result = search_reflections("retrocompatibilidad")
+        assert "error" not in result
+        assert len(result["results"]) >= 1
+        assert any(r["id"] == ref["id"] for r in result["results"])

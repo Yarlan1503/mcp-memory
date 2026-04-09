@@ -868,6 +868,17 @@ class MemoryStore:
         self.db.commit()
         return cursor.rowcount > 0
 
+    def get_relation_by_id(self, relation_id: int) -> dict | None:
+        """Get a single relation by its ID. Returns dict or None."""
+        row = self.db.execute(
+            "SELECT id, from_entity, to_entity, relation_type, context, active, ended_at, created_at "
+            "FROM relations WHERE id = ?",
+            (relation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
     def delete_relation(
         self, from_entity_id: int, to_entity_id: int, relation_type: str
     ) -> bool:

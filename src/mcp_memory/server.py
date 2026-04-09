@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import math
 import random
 import sys
 import time
@@ -1398,14 +1399,41 @@ def search_reflections(
         # Build result map for scoring
         row_map = {r["id"]: dict(r) for r in rows}
 
-        # Step 5: Sort by RRF score (or KNN distance) and limit
+        # Step 5: Apply recency scoring and sort
+        # Recency factor: max(0.1, exp(-0.0001 * hours_since_creation))
+        # Recent reflections rank higher than old ones
+        REFLECTION_TEMPORAL_FLOOR = 0.1
+        REFLECTION_TEMPORAL_LAMBDA = 0.0001  # Same half-life as entity scoring
+
+        from datetime import datetime, timezone
+
         results = []
         if merged:
             for item in merged:
                 rid = item["entity_id"]
                 if rid in row_map:
                     result_item = row_map[rid]
-                    result_item["score"] = round(item["rrf_score"], 6)
+                    base_score = item["rrf_score"]
+                    # Compute recency factor from created_at
+                    created_at_str = result_item.get("created_at", "")
+                    recency = 1.0
+                    if created_at_str:
+                        try:
+                            dt = datetime.strptime(
+                                created_at_str, "%Y-%m-%d %H:%M:%S"
+                            ).replace(tzinfo=timezone.utc)
+                            hours = max(
+                                0.0,
+                                (datetime.now(timezone.utc) - dt).total_seconds()
+                                / 3600.0,
+                            )
+                            recency = max(
+                                REFLECTION_TEMPORAL_FLOOR,
+                                math.exp(-REFLECTION_TEMPORAL_LAMBDA * hours),
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                    result_item["score"] = round(base_score * recency, 6)
                     results.append(result_item)
         else:
             # Pure semantic — sort by distance
@@ -1413,17 +1441,118 @@ def search_reflections(
                 rid = item["entity_id"]
                 if rid in row_map:
                     result_item = row_map[rid]
-                    result_item["score"] = round(
-                        1.0 - item["distance"], 4
-                    )  # Convert distance to similarity
+                    base_score = 1.0 - item["distance"]
+                    # Compute recency factor from created_at
+                    created_at_str = result_item.get("created_at", "")
+                    recency = 1.0
+                    if created_at_str:
+                        try:
+                            dt = datetime.strptime(
+                                created_at_str, "%Y-%m-%d %H:%M:%S"
+                            ).replace(tzinfo=timezone.utc)
+                            hours = max(
+                                0.0,
+                                (datetime.now(timezone.utc) - dt).total_seconds()
+                                / 3600.0,
+                            )
+                            recency = max(
+                                REFLECTION_TEMPORAL_FLOOR,
+                                math.exp(-REFLECTION_TEMPORAL_LAMBDA * hours),
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                    result_item["score"] = round(base_score * recency, 4)
                     results.append(result_item)
 
+        # Sort by score descending (highest first)
+        results.sort(key=lambda x: x["score"], reverse=True)
         results = results[:limit]
 
         return {"results": results}
 
     except Exception as e:
         logger.error("Error in search_reflections: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 20: end_relation
+# ============================================================
+@mcp.tool
+def end_relation(relation_id: int) -> dict[str, Any]:
+    """Expire an active relation by setting active=0 and ended_at=now.
+
+    For inverse pairs (contiene↔parte_de), also expires the inverse relation.
+
+    Args:
+        relation_id: The ID of the relation to expire.
+    """
+    try:
+        from mcp_memory.storage import INVERSE_RELATIONS
+
+        # 1. Look up the relation
+        rel = store.get_relation_by_id(relation_id)
+        if rel is None:
+            return {"error": f"Relation with id={relation_id} not found"}
+
+        # 2. Check if already inactive
+        if rel["active"] == 0:
+            # Already expired — return notice, not error
+            return {
+                "notice": f"Relation {relation_id} is already inactive",
+                "relation": {
+                    "id": rel["id"],
+                    "from_entity": rel["from_entity"],
+                    "to_entity": rel["to_entity"],
+                    "relation_type": rel["relation_type"],
+                    "active": bool(rel["active"]),
+                    "ended_at": rel["ended_at"],
+                },
+            }
+
+        # 3. Expire the relation
+        success = store._end_relation(relation_id)
+        if not success:
+            return {"error": f"Failed to expire relation {relation_id}"}
+
+        # 4. Check for inverse and expire it too
+        inverse_expired = None
+        inverse_type = INVERSE_RELATIONS.get(rel["relation_type"])
+        if inverse_type:
+            # Find the inverse: (to_entity, from_entity, inverse_type)
+            inv_row = store.db.execute(
+                "SELECT id, active FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
+                (rel["to_entity"], rel["from_entity"], inverse_type),
+            ).fetchone()
+            if inv_row and inv_row["active"] == 1:
+                store._end_relation(inv_row["id"])
+                inverse_expired = inv_row["id"]
+
+        # 5. Re-fetch to get updated ended_at
+        updated = store.get_relation_by_id(relation_id)
+
+        # Resolve entity names for the response
+        from_ent = store.get_entity_by_id(rel["from_entity"])
+        to_ent = store.get_entity_by_id(rel["to_entity"])
+
+        result = {
+            "relation": {
+                "id": updated["id"],
+                "from": from_ent["name"] if from_ent else str(rel["from_entity"]),
+                "to": to_ent["name"] if to_ent else str(rel["to_entity"]),
+                "relation_type": updated["relation_type"],
+                "active": bool(updated["active"]),
+                "ended_at": updated["ended_at"],
+                "context": updated["context"],
+            }
+        }
+        if inverse_expired is not None:
+            result["inverse_expired_id"] = inverse_expired
+
+        return result
+
+    except Exception as e:
+        logger.error("Error in end_relation: %s", e)
         return {"error": str(e)}
 
 
