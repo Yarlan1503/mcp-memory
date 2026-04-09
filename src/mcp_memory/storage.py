@@ -8,6 +8,23 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# --- Phase 3: Inverse relation map ---
+INVERSE_RELATIONS: dict[str, str] = {
+    "contiene": "parte_de",
+    "parte_de": "contiene",
+}
+
+# --- Phase 3: Legacy relation type normalization ---
+LEGACY_RELATION_TYPES: dict[str, tuple[str, str]] = {
+    "continua": ("contribuye_a", "sesión continuación"),
+    "documentado_en": ("producido_por", "documentado en"),
+}
+
+# --- Phase 4: Reflections validation constants ---
+VALID_TARGET_TYPES = {"entity", "session", "relation", "global"}
+VALID_AUTHORS = {"nolan", "sofia"}
+VALID_MOODS = {"frustracion", "satisfaccion", "curiosidad", "duda", "insight"}
+
 
 class MemoryStore:
     """Persistent memory store backed by SQLite with optional sqlite-vec embeddings."""
@@ -235,6 +252,59 @@ class MemoryStore:
         # --- Idempotent migrations ---
         self._add_similarity_flag_column()
         self._add_entity_access_log_table()
+        self._add_kind_column()
+        self._add_supersedes_columns()
+        self._migrate_status_column()
+        self._migrate_relation_fields()
+        self._migrate_relation_types()
+
+        # --- Phase 4: Reflections table ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reflections (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_type TEXT NOT NULL,
+                target_id   INTEGER,
+                author      TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                mood        TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            """
+        )
+
+        # Phase 4: FTS5 index for reflections (content sync manual)
+        if self._fts_available:
+            try:
+                cur.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS reflection_fts USING fts5(
+                        content,
+                        author,
+                        mood,
+                        content='reflections',
+                        content_rowid='id'
+                    );
+                    """
+                )
+                logger.info("reflection_fts virtual table created.")
+            except Exception as exc:
+                logger.error("Failed to create reflection_fts table: %s", exc)
+
+        # Phase 4: Embedding index for reflections
+        if self._vec_loaded:
+            try:
+                cur.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS reflection_embeddings
+                    USING vec0(embedding float[384]);
+                    """
+                )
+                logger.info("reflection_embeddings virtual table created.")
+            except Exception as exc:
+                logger.error("Failed to create reflection_embeddings table: %s", exc)
+
+        self.db.commit()
 
     def _add_entity_access_log_table(self) -> None:
         """Idempotent migration: create entity_access_log table for day-level access tracking."""
@@ -266,21 +336,118 @@ class MemoryStore:
         except Exception as exc:
             logger.warning("Failed to add similarity_flag column: %s", exc)
 
+    def _add_kind_column(self) -> None:
+        """Idempotent migration: add kind column to observations if missing."""
+        try:
+            cols = self.db.execute("PRAGMA table_info(observations)").fetchall()
+            col_names = {c["name"] for c in cols}
+            if "kind" not in col_names:
+                self.db.execute(
+                    "ALTER TABLE observations ADD COLUMN kind "
+                    "TEXT NOT NULL DEFAULT 'generic'"
+                )
+                self.db.commit()
+                logger.info("Added kind column to observations table.")
+        except Exception as exc:
+            logger.warning("Failed to add kind column: %s", exc)
+
+    def _add_supersedes_columns(self) -> None:
+        """Idempotent migration: add supersedes and superseded_at columns to observations if missing."""
+        try:
+            cols = self.db.execute("PRAGMA table_info(observations)").fetchall()
+            col_names = {c["name"] for c in cols}
+            if "supersedes" not in col_names:
+                self.db.execute(
+                    "ALTER TABLE observations ADD COLUMN supersedes "
+                    "INTEGER NULL REFERENCES observations(id)"
+                )
+                self.db.commit()
+                logger.info("Added supersedes column to observations table.")
+            if "superseded_at" not in col_names:
+                self.db.execute(
+                    "ALTER TABLE observations ADD COLUMN superseded_at TEXT NULL"
+                )
+                self.db.commit()
+                logger.info("Added superseded_at column to observations table.")
+        except Exception as exc:
+            logger.warning("Failed to add supersedes columns: %s", exc)
+
+    def _migrate_status_column(self) -> None:
+        """Idempotent migration: add status column to entities if missing."""
+        try:
+            cols = self.db.execute("PRAGMA table_info(entities)").fetchall()
+            col_names = {c["name"] for c in cols}
+            if "status" not in col_names:
+                self.db.execute(
+                    "ALTER TABLE entities ADD COLUMN status "
+                    "TEXT NOT NULL DEFAULT 'activo'"
+                )
+                self.db.commit()
+                logger.info("Added status column to entities table.")
+        except Exception as exc:
+            logger.warning("Failed to add status column: %s", exc)
+
+    def _migrate_relation_fields(self) -> None:
+        """Idempotent migration: add context, active, ended_at columns to relations if missing."""
+        try:
+            cols = self.db.execute("PRAGMA table_info(relations)").fetchall()
+            col_names = {c["name"] for c in cols}
+            if "context" not in col_names:
+                self.db.execute("ALTER TABLE relations ADD COLUMN context TEXT NULL")
+                self.db.commit()
+                logger.info("Added context column to relations table.")
+            if "active" not in col_names:
+                self.db.execute(
+                    "ALTER TABLE relations ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
+                )
+                self.db.commit()
+                logger.info("Added active column to relations table.")
+            if "ended_at" not in col_names:
+                self.db.execute("ALTER TABLE relations ADD COLUMN ended_at TEXT NULL")
+                self.db.commit()
+                logger.info("Added ended_at column to relations table.")
+        except Exception as exc:
+            logger.warning("Failed to add relation fields: %s", exc)
+
+    def _migrate_relation_types(self) -> None:
+        """Idempotent migration: normalize legacy relation types.
+        Updates legacy types to their modern equivalents, setting context
+        only if the existing context is NULL."""
+        try:
+            for legacy_type, (new_type, reason) in LEGACY_RELATION_TYPES.items():
+                cursor = self.db.execute(
+                    "UPDATE relations SET relation_type = ?, "
+                    "context = CASE WHEN context IS NULL THEN ? ELSE context END "
+                    "WHERE relation_type = ?",
+                    (new_type, reason, legacy_type),
+                )
+                if cursor.rowcount > 0:
+                    self.db.commit()
+                    logger.info(
+                        "Migrated %d relations from '%s' to '%s'.",
+                        cursor.rowcount,
+                        legacy_type,
+                        new_type,
+                    )
+        except Exception as exc:
+            logger.warning("Failed to migrate relation types: %s", exc)
+
     # ------------------------------------------------------------------
     # Entity CRUD
     # ------------------------------------------------------------------
 
-    def upsert_entity(self, name: str, entity_type: str) -> int:
+    def upsert_entity(self, name: str, entity_type: str, status: str = "activo") -> int:
         """INSERT or UPDATE entity. Returns entity_id. Updates updated_at."""
         self.db.execute(
             """
-            INSERT INTO entities (name, entity_type)
-            VALUES (?, ?)
+            INSERT INTO entities (name, entity_type, status)
+            VALUES (?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 entity_type = excluded.entity_type,
+                status = excluded.status,
                 updated_at  = datetime('now');
             """,
-            (name, entity_type),
+            (name, entity_type, status),
         )
         self.db.commit()
         row = self.db.execute(
@@ -293,7 +460,7 @@ class MemoryStore:
     def get_entity_by_name(self, name: str) -> dict | None:
         """Returns entity dict or None."""
         row = self.db.execute(
-            "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE name = ?",
+            "SELECT id, name, entity_type, status, created_at, updated_at FROM entities WHERE name = ?",
             (name,),
         ).fetchone()
         if row is None:
@@ -303,7 +470,7 @@ class MemoryStore:
     def get_entity_by_id(self, entity_id: int) -> dict | None:
         """Get entity by ID."""
         row = self.db.execute(
-            "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE id = ?",
+            "SELECT id, name, entity_type, status, created_at, updated_at FROM entities WHERE id = ?",
             (entity_id,),
         ).fetchone()
         if row is None:
@@ -315,7 +482,7 @@ class MemoryStore:
         entities = [
             dict(r)
             for r in self.db.execute(
-                "SELECT id, name, entity_type, created_at, updated_at FROM entities"
+                "SELECT id, name, entity_type, status, created_at, updated_at FROM entities"
             ).fetchall()
         ]
         for entity in entities:
@@ -387,7 +554,7 @@ class MemoryStore:
         pattern = f"%{query}%"
         rows = self.db.execute(
             """
-            SELECT DISTINCT e.id, e.name, e.entity_type, e.created_at, e.updated_at
+            SELECT DISTINCT e.id, e.name, e.entity_type, e.status, e.created_at, e.updated_at
             FROM entities e
             LEFT JOIN observations o ON o.entity_id = e.id
             WHERE e.name LIKE ? OR e.entity_type LIKE ? OR o.content LIKE ?
@@ -406,13 +573,49 @@ class MemoryStore:
     # Observation CRUD
     # ------------------------------------------------------------------
 
-    def add_observations(self, entity_id: int, observations: list[str]) -> int:
+    def add_observations(
+        self,
+        entity_id: int,
+        observations: list[str],
+        kind: str = "generic",
+        supersedes: int | None = None,
+    ) -> int:
         """INSERT multiple observations. Returns count inserted.
         Skips duplicates (same content for same entity).
         Observations semantically similar to existing ones (cosine >= 0.85)
-        are inserted with similarity_flag=1 for later review."""
+        are inserted with similarity_flag=1 for later review.
+
+        Args:
+            entity_id: The entity to add observations to.
+            observations: List of observation strings.
+            kind: The kind/type of observations (default 'generic').
+            supersedes: Optional observation ID to supersede. The referenced obs
+                will be marked with superseded_at, and the new obs will reference it.
+        """
         if not observations:
             return 0
+
+        # --- Handle supersedes logic ---
+        if supersedes is not None:
+            # Verify the observation exists and belongs to this entity
+            row = self.db.execute(
+                "SELECT id, entity_id, superseded_at FROM observations WHERE id = ?",
+                (supersedes,),
+            ).fetchone()
+            if row is None or row["entity_id"] != entity_id:
+                logger.warning(
+                    "Supersedes ID %s does not exist or belongs to different entity (expected %s). Ignoring.",
+                    supersedes,
+                    entity_id,
+                )
+                supersedes = None
+            elif row["superseded_at"] is not None:
+                logger.warning(
+                    "Observation %s is already superseded (at %s). Ignoring supersedes.",
+                    supersedes,
+                    row["superseded_at"],
+                )
+                supersedes = None
 
         inserted = 0
 
@@ -460,9 +663,9 @@ class MemoryStore:
                     )
 
                     self.db.execute(
-                        "INSERT INTO observations (entity_id, content, similarity_flag) "
-                        "VALUES (?, ?, ?)",
-                        (entity_id, content, flag),
+                        "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        (entity_id, content, flag, kind),
                     )
                     inserted += 1
 
@@ -479,9 +682,9 @@ class MemoryStore:
                     if exact:
                         continue
                     self.db.execute(
-                        "INSERT INTO observations (entity_id, content, similarity_flag) "
-                        "VALUES (?, ?, 0)",
-                        (entity_id, content),
+                        "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                        "VALUES (?, ?, 0, ?)",
+                        (entity_id, content, kind),
                     )
                     inserted += 1
         else:
@@ -494,37 +697,85 @@ class MemoryStore:
                 if exact:
                     continue
                 self.db.execute(
-                    "INSERT INTO observations (entity_id, content, similarity_flag) "
-                    "VALUES (?, ?, 0)",
-                    (entity_id, content),
+                    "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                    "VALUES (?, ?, 0, ?)",
+                    (entity_id, content, kind),
                 )
                 inserted += 1
+
+        # --- Apply supersedes after insertion ---
+        if supersedes is not None and inserted > 0:
+            # Mark old observation as superseded
+            self.db.execute(
+                "UPDATE observations SET superseded_at = datetime('now') WHERE id = ?",
+                (supersedes,),
+            )
+            # Get the ID of the last inserted observation for this entity
+            new_obs_row = self.db.execute(
+                "SELECT id FROM observations WHERE entity_id = ? ORDER BY id DESC LIMIT 1",
+                (entity_id,),
+            ).fetchone()
+            if new_obs_row:
+                self.db.execute(
+                    "UPDATE observations SET supersedes = ? WHERE id = ?",
+                    (supersedes, new_obs_row["id"]),
+                )
 
         if inserted:
             self.db.commit()
             self._sync_fts(entity_id)
         return inserted
 
-    def get_observations(self, entity_id: int) -> list[str]:
-        """All observations for an entity (content only)."""
-        rows = self.db.execute(
-            "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-            (entity_id,),
-        ).fetchall()
+    def get_observations(
+        self, entity_id: int, exclude_superseded: bool = True
+    ) -> list[str]:
+        """All observations for an entity (content only).
+
+        Args:
+            entity_id: The entity ID.
+            exclude_superseded: If True, exclude observations that have been superseded.
+        """
+        if exclude_superseded:
+            rows = self.db.execute(
+                "SELECT content FROM observations WHERE entity_id = ? AND superseded_at IS NULL ORDER BY id",
+                (entity_id,),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+                (entity_id,),
+            ).fetchall()
         return [r["content"] for r in rows]
 
-    def get_observations_with_ids(self, entity_id: int) -> list[dict]:
-        """All observations for an entity with id, content, and similarity_flag."""
-        rows = self.db.execute(
-            "SELECT id, content, similarity_flag FROM observations "
-            "WHERE entity_id = ? ORDER BY id",
-            (entity_id,),
-        ).fetchall()
+    def get_observations_with_ids(
+        self, entity_id: int, exclude_superseded: bool = True
+    ) -> list[dict]:
+        """All observations for an entity with id, content, similarity_flag, kind, supersedes, superseded_at.
+
+        Args:
+            entity_id: The entity ID.
+            exclude_superseded: If True, exclude observations that have been superseded.
+        """
+        if exclude_superseded:
+            rows = self.db.execute(
+                "SELECT id, content, similarity_flag, kind, supersedes, superseded_at "
+                "FROM observations WHERE entity_id = ? AND superseded_at IS NULL ORDER BY id",
+                (entity_id,),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT id, content, similarity_flag, kind, supersedes, superseded_at "
+                "FROM observations WHERE entity_id = ? ORDER BY id",
+                (entity_id,),
+            ).fetchall()
         return [
             {
                 "id": r["id"],
                 "content": r["content"],
                 "similarity_flag": r["similarity_flag"],
+                "kind": r["kind"] if r["kind"] is not None else "generic",
+                "supersedes": r["supersedes"],
+                "superseded_at": r["superseded_at"],
             }
             for r in rows
         ]
@@ -547,22 +798,75 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def create_relation(
-        self, from_entity_id: int, to_entity_id: int, relation_type: str
+        self,
+        from_entity_id: int,
+        to_entity_id: int,
+        relation_type: str,
+        context: str | None = None,
     ) -> bool:
-        """INSERT relation. ON CONFLICT -> return False (already exists)."""
+        """INSERT relation. ON CONFLICT -> return False (already exists).
+        If relation_type has an inverse, automatically creates the inverse relation."""
         try:
             self.db.execute(
                 """
-                INSERT INTO relations (from_entity, to_entity, relation_type)
-                VALUES (?, ?, ?);
+                INSERT INTO relations (from_entity, to_entity, relation_type, context)
+                VALUES (?, ?, ?, ?);
                 """,
-                (from_entity_id, to_entity_id, relation_type),
+                (from_entity_id, to_entity_id, relation_type, context),
             )
             self.db.commit()
+            # Auto-create inverse relation (best-effort)
+            self._ensure_inverse_relation(
+                from_entity_id, to_entity_id, relation_type, context
+            )
             return True
         except sqlite3.IntegrityError:
             # UNIQUE constraint violated -> already exists
             return False
+
+    def _ensure_inverse_relation(
+        self,
+        from_id: int,
+        to_id: int,
+        relation_type: str,
+        context: str | None = None,
+    ) -> None:
+        """Auto-create the inverse relation if one is defined in INVERSE_RELATIONS.
+        Best-effort: silently skips if inverse already exists or type has no inverse."""
+        inverse_type = INVERSE_RELATIONS.get(relation_type)
+        if inverse_type is None:
+            return
+
+        # Build context for the inverse
+        inverse_context = f"Inversa automática de {relation_type}"
+
+        try:
+            # Check if inverse already exists to avoid IntegrityError noise
+            existing = self.db.execute(
+                "SELECT 1 FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
+                (to_id, from_id, inverse_type),
+            ).fetchone()
+            if existing:
+                return
+
+            self.db.execute(
+                "INSERT INTO relations (from_entity, to_entity, relation_type, context) VALUES (?, ?, ?, ?)",
+                (to_id, from_id, inverse_type, inverse_context),
+            )
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            # Race condition or already exists — ignore
+            pass
+
+    def _end_relation(self, relation_id: int) -> bool:
+        """Deactivate a relation by setting active=0 and ended_at.
+        Returns True if the relation was found and updated, False otherwise."""
+        cursor = self.db.execute(
+            "UPDATE relations SET active = 0, ended_at = datetime('now') WHERE id = ?",
+            (relation_id,),
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
 
     def delete_relation(
         self, from_entity_id: int, to_entity_id: int, relation_type: str
@@ -580,10 +884,12 @@ class MemoryStore:
 
     def get_all_relations(self) -> list[dict]:
         """All relations with entity names (JOIN).
-        Returns list of {"from": entity_name, "to": entity_name, "relationType": relation_type}."""
+        Returns list of {"from": entity_name, "to": entity_name, "relationType": relation_type,
+                          "context": str|None, "active": 1|0, "ended_at": str|None}."""
         rows = self.db.execute(
             """
-            SELECT e1.name AS from_name, e2.name AS to_name, r.relation_type
+            SELECT e1.name AS from_name, e2.name AS to_name, r.relation_type,
+                   r.context, r.active, r.ended_at
             FROM relations r
             JOIN entities e1 ON r.from_entity = e1.id
             JOIN entities e2 ON r.to_entity   = e2.id;
@@ -594,6 +900,9 @@ class MemoryStore:
                 "from": r["from_name"],
                 "to": r["to_name"],
                 "relationType": r["relation_type"],
+                "context": r["context"],
+                "active": r["active"],
+                "ended_at": r["ended_at"],
             }
             for r in rows
         ]
@@ -601,13 +910,13 @@ class MemoryStore:
     def get_relations_for_entity(self, entity_id: int) -> list[dict]:
         """Get all relations for an entity (both from and to), with resolved entity names.
 
-        Returns list of dicts with relation_type, target_name, and direction.
-        For 'from' relations, target is the to_entity.
-        For 'to' relations, target is the from_entity.
+        Returns list of dicts with relation_type, target_name, direction,
+        context, active, and ended_at.
         """
         rows = self.db.execute(
             """
-            SELECT r.from_entity, r.to_entity, r.relation_type,
+            SELECT r.id, r.from_entity, r.to_entity, r.relation_type,
+                   r.context, r.active, r.ended_at,
                    e_from.name AS from_name, e_to.name AS to_name
             FROM relations r
             JOIN entities e_from ON r.from_entity = e_from.id
@@ -625,6 +934,9 @@ class MemoryStore:
                         "relation_type": r["relation_type"],
                         "target_name": r["to_name"],
                         "direction": "from",
+                        "context": r["context"],
+                        "active": r["active"],
+                        "ended_at": r["ended_at"],
                     }
                 )
             else:
@@ -633,6 +945,9 @@ class MemoryStore:
                         "relation_type": r["relation_type"],
                         "target_name": r["from_name"],
                         "direction": "to",
+                        "context": r["context"],
+                        "active": r["active"],
+                        "ended_at": r["ended_at"],
                     }
                 )
         return result
@@ -883,8 +1198,18 @@ class MemoryStore:
             entity = self.get_entity_by_id(entity_id)
             if not entity:
                 return
-            obs = self.get_observations(entity_id)
-            obs_text = " | ".join(obs)
+            obs_data = self.get_observations_with_ids(
+                entity_id, exclude_superseded=True
+            )
+            obs_parts = []
+            for o in obs_data:
+                kind = o.get("kind", "generic")
+                content = o["content"]
+                if kind != "generic":
+                    obs_parts.append(f"[{kind}] {content}")
+                else:
+                    obs_parts.append(content)
+            obs_text = " | ".join(obs_parts)
             self.db.execute(
                 "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
                 (entity_id, entity["name"], entity["entity_type"], obs_text),
@@ -912,8 +1237,18 @@ class MemoryStore:
             if not entities:
                 return
             for e in entities:
-                obs = self.get_observations(e["id"])
-                obs_text = " | ".join(obs)
+                obs_data = self.get_observations_with_ids(
+                    e["id"], exclude_superseded=True
+                )
+                obs_parts = []
+                for o in obs_data:
+                    kind = o.get("kind", "generic")
+                    content = o["content"]
+                    if kind != "generic":
+                        obs_parts.append(f"[{kind}] {content}")
+                    else:
+                        obs_parts.append(content)
+                obs_text = " | ".join(obs_parts)
                 self.db.execute(
                     "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
                     (e["id"], e["name"], e["entity_type"], obs_text),
@@ -1068,6 +1403,165 @@ class MemoryStore:
             )
 
     # ------------------------------------------------------------------
+    # Phase 4: Reflections CRUD
+    # ------------------------------------------------------------------
+
+    def add_reflection(
+        self,
+        target_type: str,
+        target_id: int | None,
+        author: str,
+        content: str,
+        mood: str | None = None,
+    ) -> dict | None:
+        """Add a narrative reflection. Returns the reflection dict or None on error.
+
+        Validates target_type, author, and mood.
+        If target_type is 'entity' or 'relation', target_id is required.
+        If target_type is 'global', target_id must be None.
+        Generates embedding and syncs FTS.
+        """
+        # Validations
+        if target_type not in VALID_TARGET_TYPES:
+            logger.warning("Invalid target_type: %s", target_type)
+            return None
+        if author not in VALID_AUTHORS:
+            logger.warning("Invalid author: %s", author)
+            return None
+        if mood is not None and mood not in VALID_MOODS:
+            logger.warning("Invalid mood: %s", mood)
+            return None
+        if target_type in ("entity", "session", "relation") and target_id is None:
+            logger.warning("target_id required for target_type '%s'", target_type)
+            return None
+        if target_type == "global" and target_id is not None:
+            logger.warning("target_id must be None for global reflections")
+            return None
+
+        # Insert reflection
+        cursor = self.db.execute(
+            "INSERT INTO reflections (target_type, target_id, author, content, mood) VALUES (?, ?, ?, ?, ?)",
+            (target_type, target_id, author, content, mood),
+        )
+        self.db.commit()
+        reflection_id = cursor.lastrowid
+
+        # Sync FTS (manual content sync)
+        if self._fts_available:
+            try:
+                self.db.execute(
+                    "INSERT INTO reflection_fts(rowid, content, author, mood) VALUES (?, ?, ?, ?)",
+                    (reflection_id, content, author, mood or ""),
+                )
+                self.db.commit()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to sync reflection FTS for id %s: %s", reflection_id, exc
+                )
+
+        # Generate embedding
+        engine = self._get_embedding_engine()
+        if engine and engine.available:
+            try:
+                from mcp_memory.embeddings import serialize_f32
+
+                vector = engine.encode([content])
+                embedding_bytes = serialize_f32(vector[0])
+                self.db.execute(
+                    "INSERT INTO reflection_embeddings(rowid, embedding) VALUES (?, ?)",
+                    (reflection_id, embedding_bytes),
+                )
+                self.db.commit()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to store reflection embedding for id %s: %s",
+                    reflection_id,
+                    exc,
+                )
+
+        return {
+            "id": reflection_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "author": author,
+            "content": content,
+            "mood": mood,
+            "created_at": self.db.execute(
+                "SELECT created_at FROM reflections WHERE id = ?", (reflection_id,)
+            ).fetchone()["created_at"],
+        }
+
+    def get_reflections_for_target(
+        self, target_type: str, target_id: int | None = None
+    ) -> list[dict]:
+        """Get reflections for a specific target (entity, session, relation, or global)."""
+        if target_type == "global":
+            rows = self.db.execute(
+                "SELECT id, author, content, mood, created_at FROM reflections WHERE target_type = 'global' ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT id, author, content, mood, created_at FROM reflections WHERE target_type = ? AND target_id = ? ORDER BY created_at",
+                (target_type, target_id),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "author": r["author"],
+                "content": r["content"],
+                "mood": r["mood"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def search_reflection_fts(self, query: str, limit: int = 10) -> list[dict]:
+        """FTS5 search on reflection_fts. Returns list of {id, rank}."""
+        if not self._fts_available or not query.strip():
+            return []
+        try:
+            tokens = query.strip().split()
+            escaped = " ".join(f'"{t}"' for t in tokens if t)
+            if not escaped:
+                return []
+            rows = self.db.execute(
+                """
+                SELECT rowid AS id, rank
+                FROM reflection_fts
+                WHERE reflection_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (escaped, limit),
+            ).fetchall()
+            return [{"id": r["id"], "rank": -float(r["rank"])} for r in rows]
+        except Exception as exc:
+            logger.warning("Reflection FTS search failed: %s", exc)
+            return []
+
+    def search_reflection_embeddings(
+        self, query_embedding: bytes, limit: int = 10
+    ) -> list[dict]:
+        """KNN search on reflection_embeddings. Returns list of {id, distance}."""
+        if not self._vec_loaded:
+            return []
+        try:
+            rows = self.db.execute(
+                """
+                SELECT rowid AS id, distance
+                FROM reflection_embeddings
+                WHERE embedding MATCH ?
+                ORDER BY distance
+                LIMIT ?
+                """,
+                (query_embedding, limit),
+            ).fetchall()
+            return [{"id": r["id"], "distance": float(r["distance"])} for r in rows]
+        except Exception as exc:
+            logger.warning("Reflection embedding search failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
     # Consolidation report data (read-only queries)
     # ------------------------------------------------------------------
 
@@ -1124,7 +1618,7 @@ class MemoryStore:
         stale_param = str(int(stale_days))
         rows = self.db.execute(
             """
-            SELECT e.name, e.entity_type, e.created_at,
+            SELECT e.name, e.entity_type, e.status, e.created_at,
                    COALESCE(ea.access_count, 0) AS access_count,
                    ea.last_access,
                    COUNT(o.id) AS obs_count
@@ -1135,6 +1629,7 @@ class MemoryStore:
             HAVING (ea.last_access IS NULL
                     OR datetime(ea.last_access) < datetime('now', '-' || ? || ' days'))
                AND COALESCE(ea.access_count, 0) <= 2
+               AND e.status != 'archivado'
             ORDER BY CASE WHEN ea.last_access IS NULL THEN 0 ELSE 1 END,
                      ea.last_access ASC
             """,
@@ -1145,6 +1640,7 @@ class MemoryStore:
             {
                 "entity_name": r["name"],
                 "entity_type": r["entity_type"],
+                "status": r["status"],
                 "created_at": r["created_at"],
                 "access_count": r["access_count"],
                 "last_access": r["last_access"],

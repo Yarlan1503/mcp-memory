@@ -40,18 +40,30 @@ def _get_engine() -> Any:
         return None
 
 
-def _entity_to_output(row: dict, observations: list[str]) -> dict:
-    """Convert DB row + observations to EntityOutput dict."""
-    return {
+def _entity_to_output(
+    row: dict,
+    observations: list[str] | list[dict],
+    relations: list[dict] | None = None,
+) -> dict:
+    """Convert DB row + observations to EntityOutput dict.
+    Optionally includes relations with context, active, and ended_at."""
+    if observations and isinstance(observations[0], dict):
+        obs_list = observations
+    else:
+        # Legacy: list[str]
+        obs_list = observations
+    output = {
         "name": row["name"],
         "entityType": row["entity_type"],
-        "observations": observations,
+        "status": row.get("status", "activo"),
+        "observations": obs_list,
     }
+    if relations is not None:
+        output["relations"] = relations
+    return output
 
 
-def _recompute_embedding(
-    entity_id: int, name: str, entity_type: str, observations: list[str]
-) -> None:
+def _recompute_embedding(entity_id: int, name: str, entity_type: str) -> None:
     """Recompute and store embedding for an entity (if engine available)."""
     engine = _get_engine()
     if not engine or not getattr(engine, "available", False):
@@ -59,8 +71,16 @@ def _recompute_embedding(
     try:
         from mcp_memory.embeddings import serialize_f32
 
+        # Get entity status
+        entity_data = store.get_entity_by_id(entity_id)
+        status = entity_data.get("status", "activo") if entity_data else "activo"
+
+        # Get observations with IDs (for kind info)
+        obs_data = store.get_observations_with_ids(entity_id, exclude_superseded=True)
         relations = store.get_relations_for_entity(entity_id)
-        text = engine.prepare_entity_text(name, entity_type, observations, relations)
+        text = engine.prepare_entity_text(
+            name, entity_type, obs_data, relations, status=status
+        )
         vector = engine.encode([text])
         store.store_embedding(entity_id, serialize_f32(vector[0]))
     except Exception as e:
@@ -81,7 +101,9 @@ def create_entities(entities: list[dict[str, Any]]) -> dict[str, Any]:
             parsed = EntityInput.model_validate(entity_dict)
 
             # Upsert entity
-            entity_id = store.upsert_entity(parsed.name, parsed.entityType)
+            entity_id = store.upsert_entity(
+                parsed.name, parsed.entityType, parsed.status
+            )
 
             # Get existing observations
             existing_obs = store.get_observations(entity_id)
@@ -96,7 +118,7 @@ def create_entities(entities: list[dict[str, Any]]) -> dict[str, Any]:
             all_obs = store.get_observations(entity_id)
 
             # Recompute embedding
-            _recompute_embedding(entity_id, parsed.name, parsed.entityType, all_obs)
+            _recompute_embedding(entity_id, parsed.name, parsed.entityType)
 
             # Limbic: initialize access tracking for new/updated entity
             store.init_access(entity_id)
@@ -142,16 +164,17 @@ def create_relations(relations: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
 
             created = store.create_relation(
-                from_ent["id"], to_ent["id"], parsed.relationType
+                from_ent["id"], to_ent["id"], parsed.relationType, parsed.context
             )
             if created:
-                results.append(
-                    {
-                        "from": parsed.from_entity,
-                        "to": parsed.to_entity,
-                        "relationType": parsed.relationType,
-                    }
-                )
+                result_item = {
+                    "from": parsed.from_entity,
+                    "to": parsed.to_entity,
+                    "relationType": parsed.relationType,
+                }
+                if parsed.context:
+                    result_item["context"] = parsed.context
+                results.append(result_item)
             else:
                 results.append(
                     {
@@ -174,20 +197,32 @@ def create_relations(relations: list[dict[str, Any]]) -> dict[str, Any]:
 # TOOL 3: add_observations
 # ============================================================
 @mcp.tool
-def add_observations(name: str, observations: list[str]) -> dict[str, Any]:
-    """Add observations to an existing entity."""
+def add_observations(
+    name: str,
+    observations: list[str],
+    kind: str = "generic",
+    supersedes: int | None = None,
+) -> dict[str, Any]:
+    """Add observations to an existing entity.
+
+    Args:
+        name: Entity name.
+        observations: List of observation strings to add.
+        kind: The kind/type of observations (default 'generic').
+        supersedes: Optional observation ID to supersede. The referenced obs
+            will be marked as superseded, and the new obs will reference it."""
     try:
         entity = store.get_entity_by_name(name)
         if not entity:
             return {"error": f"Entity not found: {name}"}
 
-        store.add_observations(entity["id"], observations)
+        store.add_observations(
+            entity["id"], observations, kind=kind, supersedes=supersedes
+        )
         all_obs = store.get_observations(entity["id"])
 
         # Recompute embedding
-        _recompute_embedding(
-            entity["id"], entity["name"], entity["entity_type"], all_obs
-        )
+        _recompute_embedding(entity["id"], entity["name"], entity["entity_type"])
 
         # Limbic: record access on observation add
         store.record_access(entity["id"])
@@ -247,9 +282,7 @@ def delete_observations(name: str, observations: list[str]) -> dict[str, Any]:
         all_obs = store.get_observations(entity["id"])
 
         # Recompute embedding
-        _recompute_embedding(
-            entity["id"], entity["name"], entity["entity_type"], all_obs
-        )
+        _recompute_embedding(entity["id"], entity["name"], entity["entity_type"])
 
         return {
             "entity": {
@@ -366,19 +399,61 @@ def search_nodes(query: str) -> dict[str, Any]:
 # TOOL 8: open_nodes
 # ============================================================
 @mcp.tool
-def open_nodes(names: list[str]) -> dict[str, Any]:
-    """Open specific nodes by name. Returns full entity data with observations."""
+def open_nodes(
+    names: list[str], kinds: list[str] | None = None, include_superseded: bool = False
+) -> dict[str, Any]:
+    """Open specific nodes by name. Returns full entity data with observations.
+
+    Args:
+        names: List of entity names to open.
+        kinds: Optional filter — only include observations matching these kinds.
+            If None or empty, include all kinds.
+        include_superseded: If True, include superseded observations. Default False."""
     try:
         results = []
         opened_ids = []
         for name in names:
             entity = store.get_entity_by_name(name)
             if entity:
-                obs = store.get_observations(entity["id"])
+                obs_data = store.get_observations_with_ids(
+                    entity["id"], exclude_superseded=not include_superseded
+                )
+                if kinds:
+                    obs_data = [o for o in obs_data if o["kind"] in kinds]
+
+                # Get relations with context, active, ended_at
+                entity_relations = store.get_relations_for_entity(entity["id"])
+                rel_output = [
+                    {
+                        "relation_type": r["relation_type"],
+                        "target_name": r["target_name"],
+                        "direction": r["direction"],
+                        "context": r["context"],
+                        "active": bool(r["active"]),
+                        "ended_at": r["ended_at"],
+                    }
+                    for r in entity_relations
+                ]
+
                 # Limbic: record access on node open
                 store.record_access(entity["id"])
                 opened_ids.append(entity["id"])
-                results.append(_entity_to_output(entity, obs))
+                result_dict = _entity_to_output(entity, obs_data, relations=rel_output)
+                # Phase 4: Add reflections for this entity
+                entity_reflections = store.get_reflections_for_target(
+                    "entity", entity["id"]
+                )
+                result_dict["reflections"] = [
+                    {
+                        "id": r["id"],
+                        "author": r["author"],
+                        "content": r["content"],
+                        "mood": r["mood"],
+                        "created_at": r["created_at"],
+                    }
+                    for r in entity_reflections
+                ]
+                results.append(result_dict)
 
         # Limbic: record co-occurrences for entities opened together (best-effort)
         try:
@@ -629,6 +704,23 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                         access_days_data=access_days_data,
                     )
 
+        # --- Status de-boost: apply multiplier to limbic_score based on entity status ---
+        STATUS_MULTIPLIERS = {
+            "activo": 1.0,
+            "pausado": 0.85,
+            "completado": 0.7,
+            "archivado": 0.5,
+        }
+        if treatment == 1:
+            for item in ranked:
+                eid = item["entity_id"]
+                row = store.get_entity_by_id(eid)
+                if row:
+                    status = row.get("status", "activo")
+                    multiplier = STATUS_MULTIPLIERS.get(status, 1.0)
+                    if multiplier < 1.0 and "limbic_score" in item:
+                        item["limbic_score"] *= multiplier
+
         # --- Build output based on treatment ---
         output = []
         top_k_ids = []
@@ -689,6 +781,22 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                 # Add rrf_score if hybrid mode
                 if use_hybrid and item.get("rrf_score") is not None:
                     result_item["rrf_score"] = round(item["rrf_score"], 6)
+
+                # De-boost metadata-heavy entities
+                try:
+                    obs_data = store.get_observations_with_ids(
+                        eid, exclude_superseded=True
+                    )
+                    if obs_data:
+                        metadata_ratio = sum(
+                            1 for o in obs_data if o.get("kind") == "metadata"
+                        ) / len(obs_data)
+                        if metadata_ratio > 0.5:  # Majority metadata
+                            result_item["limbic_score"] = round(
+                                result_item["limbic_score"] * 0.7, 4
+                            )
+                except Exception:
+                    pass  # Non-critical
 
                 output.append(result_item)
                 top_k_ids.append(eid)
@@ -1097,6 +1205,7 @@ def consolidation_report(stale_days: float = 90.0) -> dict[str, Any]:
                 {
                     "entity_name": s["entity_name"],
                     "entity_type": s["entity_type"],
+                    "status": s.get("status", "activo"),
                     "observation_count": s["observation_count"],
                     "last_access": s["last_access"],
                     "access_count": s["access_count"],
@@ -1154,6 +1263,167 @@ def consolidation_report(stale_days: float = 90.0) -> dict[str, Any]:
 
     except Exception as e:
         logger.error("Error in consolidation_report: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 18: add_reflection
+# ============================================================
+@mcp.tool
+def add_reflection(
+    target_type: str,
+    target_id: int | None = None,
+    author: str = "sofia",
+    content: str = "",
+    mood: str | None = None,
+) -> dict[str, Any]:
+    """Add a narrative reflection to give context and meaning to a memory.
+
+    Args:
+        target_type: What this reflection targets — 'entity', 'session', 'relation', or 'global'.
+        target_id: ID of the target entity/relation. Required for entity/session/relation. NULL for global.
+        author: Who wrote this — 'nolan' or 'sofia'.
+        content: The reflection text (free prose, no prefixes).
+        mood: Optional mood — 'frustracion', 'satisfaccion', 'curiosidad', 'duda', 'insight'.
+    """
+    try:
+        if not content.strip():
+            return {"error": "content cannot be empty"}
+
+        result = store.add_reflection(
+            target_type=target_type,
+            target_id=target_id,
+            author=author,
+            content=content,
+            mood=mood,
+        )
+        if result is None:
+            return {
+                "error": "Invalid parameters — check target_type, author, and mood values"
+            }
+        return {"reflection": result}
+    except Exception as e:
+        logger.error("Error in add_reflection: %s", e)
+        return {"error": str(e)}
+
+
+# ============================================================
+# TOOL 19: search_reflections
+# ============================================================
+@mcp.tool
+def search_reflections(
+    query: str,
+    author: str | None = None,
+    mood: str | None = None,
+    target_type: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Search reflections by semantic similarity and optional filters.
+
+    Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion.
+
+    Args:
+        query: Search text.
+        author: Filter by author ('nolan' or 'sofia').
+        mood: Filter by mood.
+        target_type: Filter by target type.
+        limit: Max results (default 10).
+    """
+    try:
+        engine = _get_engine()
+        if not engine or not engine.available:
+            return {
+                "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
+            }
+
+        from mcp_memory.embeddings import serialize_f32
+        from mcp_memory.scoring import reciprocal_rank_fusion
+
+        # Step 1: Semantic KNN search on reflection_embeddings
+        query_vector = engine.encode([query], task="query")
+        query_bytes = serialize_f32(query_vector[0])
+        expanded_limit = limit * 3  # Over-retrieve for filtering
+        knn_results = store.search_reflection_embeddings(
+            query_bytes, limit=expanded_limit
+        )
+
+        # Step 2: FTS5 search on reflection_fts
+        fts_results = store.search_reflection_fts(query, limit=expanded_limit)
+
+        # Step 3: RRF merge (adapt format for RRF function)
+        # reciprocal_rank_fusion expects "entity_id" but we have "id" — rename
+        knn_for_rrf = [
+            {"entity_id": r["id"], "distance": r["distance"]} for r in knn_results
+        ]
+        fts_for_rrf = [{"entity_id": r["id"], "rank": r["rank"]} for r in fts_results]
+
+        use_hybrid = len(fts_results) > 0
+        if use_hybrid:
+            merged = reciprocal_rank_fusion(knn_for_rrf, fts_for_rrf)
+            candidate_ids = [r["entity_id"] for r in merged]
+        else:
+            merged = None
+            candidate_ids = [r["entity_id"] for r in knn_for_rrf]
+
+        if not candidate_ids:
+            return {"results": []}
+
+        # Step 4: Fetch reflection data and apply filters
+        placeholders = ",".join("?" for _ in candidate_ids)
+
+        query_sql = f"""
+            SELECT r.id, r.target_type, r.target_id, r.author, r.content, r.mood, r.created_at
+            FROM reflections r
+            WHERE r.id IN ({placeholders})
+        """
+        params: list[Any] = list(candidate_ids)
+
+        # Apply filters as SQL WHERE clauses
+        conditions = []
+        if author:
+            conditions.append("r.author = ?")
+            params.append(author)
+        if mood:
+            conditions.append("r.mood = ?")
+            params.append(mood)
+        if target_type:
+            conditions.append("r.target_type = ?")
+            params.append(target_type)
+
+        if conditions:
+            query_sql += " AND " + " AND ".join(conditions)
+
+        rows = store.db.execute(query_sql, params).fetchall()
+
+        # Build result map for scoring
+        row_map = {r["id"]: dict(r) for r in rows}
+
+        # Step 5: Sort by RRF score (or KNN distance) and limit
+        results = []
+        if merged:
+            for item in merged:
+                rid = item["entity_id"]
+                if rid in row_map:
+                    result_item = row_map[rid]
+                    result_item["score"] = round(item["rrf_score"], 6)
+                    results.append(result_item)
+        else:
+            # Pure semantic — sort by distance
+            for item in knn_for_rrf:
+                rid = item["entity_id"]
+                if rid in row_map:
+                    result_item = row_map[rid]
+                    result_item["score"] = round(
+                        1.0 - item["distance"], 4
+                    )  # Convert distance to similarity
+                    results.append(result_item)
+
+        results = results[:limit]
+
+        return {"results": results}
+
+    except Exception as e:
+        logger.error("Error in search_reflections: %s", e)
         return {"error": str(e)}
 
 

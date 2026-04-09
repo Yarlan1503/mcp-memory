@@ -270,11 +270,27 @@ class EmbeddingEngine:
         return normalized.astype(np.float32)
 
     @staticmethod
+    def _format_obs(obs: str | dict) -> str:
+        """Format a single observation, adding [kind] prefix for non-generic kinds.
+
+        Args:
+            obs: Either a plain string or a dict with 'content' and optionally 'kind'.
+        """
+        if isinstance(obs, dict):
+            kind = obs.get("kind", "generic")
+            content = obs.get("content", "")
+            if kind != "generic":
+                return f"[{kind}] {content}"
+            return content
+        return obs
+
+    @staticmethod
     def prepare_entity_text(
         name: str,
         entity_type: str,
-        observations: list[str],
+        observations: list[str] | list[dict],
         relations: list[dict] | None = None,
+        status: str = "activo",
     ) -> str:
         """Format an entity for embedding with Head+Tail+Diversity selection.
 
@@ -286,9 +302,19 @@ class EmbeddingEngine:
 
         Uses ` | ` separator between observations for semantic clarity.
         Budget: MAX_TOKENS (480) estimated via CHARS_PER_TOKEN ratio.
+
+        Args:
+            name: Entity name.
+            entity_type: Entity type.
+            observations: List of observation strings or dicts (with 'content' and 'kind' keys).
+            relations: Optional list of relation dicts.
+            status: Entity status (default 'activo').
         """
-        if not observations:
-            base = f"{name} ({entity_type})"
+        # Normalize observations to formatted strings
+        formatted_obs = [EmbeddingEngine._format_obs(o) for o in observations]
+
+        if not formatted_obs:
+            base = f"{name} ({entity_type}) [{status}]"
         else:
             # Build relation context string
             rel_parts: list[str] = []
@@ -307,34 +333,34 @@ class EmbeddingEngine:
                 rel_token_budget = _estimate_tokens(rel_text)
 
             # Available budget for observations
-            header = f"{name} ({entity_type}): "
+            header = f"{name} ({entity_type}) [{status}]: "
             header_tokens = _estimate_tokens(header)
             obs_budget = MAX_TOKENS - OVERHEAD_TOKENS - header_tokens - rel_token_budget
             obs_char_budget = int(obs_budget * CHARS_PER_TOKEN)
 
             # --- Selection strategy ---
-            n = len(observations)
+            n = len(formatted_obs)
 
             # Always take head (first 3)
-            head = observations[:3]
+            head = formatted_obs[:3]
 
             if n <= 3:
                 # Very few observations — use all
-                selected = list(observations)
+                selected = list(formatted_obs)
             elif n <= 10:
                 # Moderate — take head + tail (all remaining from end)
                 tail_count = min(7, n - 3)
-                tail = observations[-tail_count:]
+                tail = formatted_obs[-tail_count:]
                 # Middle = everything between head and tail
                 middle_start = 3
                 middle_end = n - tail_count
-                middle = observations[middle_start:middle_end]
+                middle = formatted_obs[middle_start:middle_end]
                 selected = head + middle + tail
             else:
                 # Many observations — Head + Tail + Diversity middle
-                tail = observations[-7:]
+                tail = formatted_obs[-7:]
                 # Middle candidates = everything between head and tail
-                middle_candidates = observations[3:-7]
+                middle_candidates = formatted_obs[3:-7]
 
                 # Build output with head first
                 selected = list(head)

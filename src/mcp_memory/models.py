@@ -7,6 +7,7 @@ class EntityInput(BaseModel):
     name: str = Field(..., min_length=1)
     entityType: str = Field(default="Generic")
     observations: list[str] = Field(default_factory=list)
+    status: str = Field(default="activo")
 
 
 class EntityOutput(BaseModel):
@@ -14,7 +15,7 @@ class EntityOutput(BaseModel):
 
     name: str
     entityType: str
-    observations: list[str]
+    observations: list[str] | list[dict]  # Can be list[dict] with kind metadata
 
 
 class RelationInput(BaseModel):
@@ -23,6 +24,7 @@ class RelationInput(BaseModel):
     from_entity: str = Field(..., alias="from")
     to_entity: str = Field(..., alias="to")
     relationType: str
+    context: str | None = None
 
     model_config = {"populate_by_name": True}
 

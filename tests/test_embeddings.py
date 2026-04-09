@@ -23,9 +23,16 @@ class TestPrepareEntityText:
     """Tests for prepare_entity_text static method."""
 
     def test_prepare_entity_text_no_observations(self):
-        """Only name and type -> correct format."""
+        """Only name and type -> correct format with default status."""
         result = EmbeddingEngine.prepare_entity_text("TestEntity", "Testing", [])
-        assert result == "TestEntity (Testing)"
+        assert result == "TestEntity (Testing) [activo]"
+
+    def test_prepare_entity_text_no_observations_custom_status(self):
+        """Only name and type with custom status."""
+        result = EmbeddingEngine.prepare_entity_text(
+            "TestEntity", "Testing", [], status="archivado"
+        )
+        assert result == "TestEntity (Testing) [archivado]"
 
     def test_prepare_entity_text_with_observations(self):
         """Verifies observations are joined with ' | '."""
@@ -46,8 +53,8 @@ class TestPrepareEntityText:
         assert "obs8" in result  # -7 means indices 8-14
         assert "obs14" in result
         # Total selected: 3 head + diverse middle + 7 tail
-        # Header is "Entity (Type): "
-        assert result.startswith("Entity (Type): ")
+        # Header is "Entity (Type) [activo]: " with default status
+        assert result.startswith("Entity (Type) [activo]: ")
 
     def test_prepare_entity_text_with_relations(self):
         """Verifies relations are appended as 'Rel: ...'."""
