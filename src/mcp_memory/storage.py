@@ -968,13 +968,17 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def store_embedding(self, entity_id: int, embedding: bytes) -> None:
-        """INSERT OR REPLACE embedding. entity_id is rowid in vec0."""
+        """DELETE + INSERT embedding (vec0 doesn't support OR REPLACE). entity_id is rowid in vec0."""
         if not self._vec_loaded:
             logger.warning("sqlite-vec not loaded — cannot store embedding.")
             return
         try:
             self.db.execute(
-                "INSERT OR REPLACE INTO entity_embeddings(rowid, embedding) VALUES (?, ?)",
+                "DELETE FROM entity_embeddings WHERE rowid = ?",
+                (entity_id,),
+            )
+            self.db.execute(
+                "INSERT INTO entity_embeddings(rowid, embedding) VALUES (?, ?)",
                 (entity_id, embedding),
             )
             self.db.commit()
