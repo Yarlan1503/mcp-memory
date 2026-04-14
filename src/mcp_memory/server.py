@@ -524,6 +524,323 @@ def _get_treatment(query: str) -> int:
         return 0 if hash_value < (BASELINE_PROBABILITY * 100) else 1
 
 
+def _execute_hybrid_search(
+    query: str, engine: Any, limit: int
+) -> tuple[list[dict], list[dict], list[dict] | None, list[int], bool]:
+    """Execute KNN + FTS5 search and merge via RRF.
+
+    Returns: (knn_results, fts_results, merged, candidate_ids, use_hybrid)
+    """
+    from mcp_memory.embeddings import serialize_f32
+    from mcp_memory.scoring import EXPANSION_FACTOR, reciprocal_rank_fusion
+
+    query_vector = engine.encode([query], task="query")
+    query_bytes = serialize_f32(query_vector[0])
+    expanded_limit = limit * EXPANSION_FACTOR
+    knn_results = store.search_embeddings(query_bytes, limit=expanded_limit)
+
+    if not knn_results:
+        return [], [], None, [], False
+
+    fts_results = store.search_fts(query, limit=expanded_limit)
+
+    use_hybrid = len(fts_results) > 0
+    if use_hybrid:
+        merged = reciprocal_rank_fusion(knn_results, fts_results)
+        candidate_ids = [r["entity_id"] for r in merged]
+    else:
+        merged = None
+        candidate_ids = [r["entity_id"] for r in knn_results]
+
+    return knn_results, fts_results, merged, candidate_ids, use_hybrid
+
+
+def _rank_candidates(
+    treatment: int,
+    routing_strategy: Any,
+    knn_results: list[dict],
+    merged: list[dict] | None,
+    use_hybrid: bool,
+    access_data: dict,
+    degree_data: dict,
+    cooc_data: dict,
+    entity_created: dict[int, str],
+    access_days_data: dict,
+    limit: int,
+    baseline_ranked: list[dict],
+) -> list[dict]:
+    """Rank candidates based on treatment and routing strategy.
+
+    Returns: ranked list of dicts with entity_id, scores, etc.
+    """
+    from mcp_memory.scoring import (
+        RoutingStrategy,
+        rank_candidates,
+        rank_hybrid_candidates,
+        rank_with_routing_strategy,
+    )
+
+    if treatment == 0:
+        return baseline_ranked[:limit]
+
+    # LIMBIC: Apply limbic re-ranking with dynamic routing
+    if routing_strategy == RoutingStrategy.HYBRID_BALANCED:
+        if use_hybrid:
+            return rank_hybrid_candidates(
+                merged_results=merged,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+                access_days_data=access_days_data,
+            )
+        else:
+            return rank_candidates(
+                knn_results=knn_results,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+                access_days_data=access_days_data,
+            )
+    elif routing_strategy in (
+        RoutingStrategy.COSINE_HEAVY,
+        RoutingStrategy.LIMBIC_HEAVY,
+    ):
+        if use_hybrid:
+            return rank_with_routing_strategy(
+                merged_results=merged,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+                strategy=routing_strategy,
+                access_days_data=access_days_data,
+            )
+        else:
+            knn_for_routing = [
+                {
+                    "entity_id": r["entity_id"],
+                    "distance": r["distance"],
+                    "rrf_score": 1.0,
+                }
+                for r in knn_results
+            ]
+            return rank_with_routing_strategy(
+                merged_results=knn_for_routing,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+                strategy=routing_strategy,
+                access_days_data=access_days_data,
+            )
+    else:
+        # Fallback (shouldn't happen): use original limbic scoring
+        if use_hybrid:
+            return rank_hybrid_candidates(
+                merged_results=merged,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+                access_days_data=access_days_data,
+            )
+        else:
+            return rank_candidates(
+                knn_results=knn_results,
+                access_data=access_data,
+                degree_data=degree_data,
+                cooc_data=cooc_data,
+                entity_created=entity_created,
+                limit=limit,
+                access_days_data=access_days_data,
+            )
+
+
+def _apply_deboosts(ranked: list[dict], treatment: int) -> list[dict]:
+    """Apply status and metadata deboosts to ranked results.
+
+    Modifies limbic_score in-place and returns ranked.
+    """
+    STATUS_MULTIPLIERS = {
+        "activo": 1.0,
+        "pausado": 0.85,
+        "completado": 0.7,
+        "archivado": 0.5,
+    }
+
+    if treatment == 1:
+        for item in ranked:
+            eid = item["entity_id"]
+            row = store.get_entity_by_id(eid)
+            if row:
+                status = row.get("status", "activo")
+                multiplier = STATUS_MULTIPLIERS.get(status, 1.0)
+                if multiplier < 1.0 and "limbic_score" in item:
+                    item["limbic_score"] *= multiplier
+
+            # De-boost metadata-heavy entities
+            try:
+                obs_data = store.get_observations_with_ids(
+                    eid, exclude_superseded=True
+                )
+                if obs_data:
+                    metadata_ratio = sum(
+                        1 for o in obs_data if o.get("kind") == "metadata"
+                    ) / len(obs_data)
+                    if metadata_ratio > 0.5 and "limbic_score" in item:
+                        item["limbic_score"] = round(
+                            round(item["limbic_score"], 4) * 0.7, 4
+                        )
+            except Exception:
+                pass  # Non-critical
+
+    return ranked
+
+
+def _build_search_output(
+    ranked: list[dict],
+    treatment: int,
+    routing_strategy: Any,
+    use_hybrid: bool,
+) -> tuple[list[dict], list[int]]:
+    """Build the output result list from ranked candidates.
+
+    Returns: (output_list, top_k_entity_ids)
+    """
+    output = []
+    top_k_ids = []
+
+    if treatment == 0:
+        for item in ranked:
+            eid = item["entity_id"]
+            row = store.get_entity_by_id(eid)
+            if not row:
+                continue
+
+            obs = store.get_observations(eid)
+            result_item = {
+                "name": row["name"],
+                "entityType": row["entity_type"],
+                "observations": obs,
+                "distance": round(1.0 - item.get("cosine_sim", 0.0), 4),
+                "treatment": "baseline",
+            }
+
+            result_item["cosine_sim"] = round(item.get("cosine_sim", 0.0), 4)
+
+            output.append(result_item)
+            top_k_ids.append(eid)
+    else:
+        for item in ranked:
+            eid = item["entity_id"]
+            row = store.get_entity_by_id(eid)
+            if not row:
+                continue
+
+            obs = store.get_observations(eid)
+            result_item = {
+                "name": row["name"],
+                "entityType": row["entity_type"],
+                "observations": obs,
+                "limbic_score": round(item.get("limbic_score", 0.0), 4),
+                "scoring": {
+                    "importance": round(item.get("importance", 0.0), 4),
+                    "temporal_factor": round(item.get("temporal_factor", 1.0), 4),
+                    "cooc_boost": round(item.get("cooc_boost", 0.0), 4),
+                },
+                "routing_strategy": item.get(
+                    "routing_strategy",
+                    routing_strategy.value if routing_strategy else "hybrid_balanced",
+                ),
+            }
+
+            if item.get("distance") is not None:
+                result_item["distance"] = round(item["distance"], 4)
+
+            if use_hybrid and item.get("rrf_score") is not None:
+                result_item["rrf_score"] = round(item["rrf_score"], 6)
+
+            output.append(result_item)
+            top_k_ids.append(eid)
+
+    return output, top_k_ids
+
+
+def _log_shadow_and_track(
+    event_id: int | None,
+    ranked: list[dict],
+    treatment: int,
+    baseline_ranked: list[dict],
+    top_k_ids: list[int],
+    shadow_start_time: float,
+) -> None:
+    """Log shadow mode results and record limbic access tracking."""
+    if event_id is not None:
+        try:
+            baseline_map = {
+                r["entity_id"]: r["baseline_rank"] for r in baseline_ranked
+            }
+
+            results_to_log = []
+            for rank_pos, rank_item in enumerate(ranked):
+                eid = rank_item["entity_id"]
+                row = store.get_entity_by_id(eid)
+                if not row:
+                    continue
+
+                log_entry = {
+                    "entity_id": eid,
+                    "entity_name": row["name"],
+                    "rank": rank_pos + 1,
+                    "baseline_rank": baseline_map.get(eid),
+                }
+
+                if treatment == 1:
+                    log_entry["limbic_score"] = rank_item.get("limbic_score", 0.0)
+                    log_entry["cosine_sim"] = max(
+                        0.0, 1.0 - rank_item.get("distance", 1.0)
+                    )
+                    log_entry["importance"] = rank_item.get("importance", 0.0)
+                    log_entry["temporal"] = rank_item.get("temporal_factor", 1.0)
+                    log_entry["cooc_boost"] = rank_item.get("cooc_boost", 0.0)
+                else:
+                    log_entry["cosine_sim"] = rank_item.get("cosine_sim", 0.0)
+
+                results_to_log.append(log_entry)
+
+            store.log_search_results(event_id, results_to_log)
+
+            duration_ms = (time.perf_counter() - shadow_start_time) * 1000
+            try:
+                store.update_search_event_completion(
+                    event_id=event_id,
+                    num_results=len(top_k_ids),
+                    duration_ms=duration_ms,
+                    engine_used="limbic" if treatment == 1 else "baseline",
+                )
+            except Exception:
+                pass  # Non-critical
+
+        except Exception as e:
+            logger.warning("Shadow mode result logging failed: %s", e)
+
+    if treatment == 1:
+        try:
+            for eid in top_k_ids:
+                store.record_access(eid)
+            if len(top_k_ids) >= 2:
+                store.record_co_occurrences(top_k_ids)
+        except Exception as e:
+            logger.warning("Limbic tracking failed: %s", e)
+
+
 @mcp.tool
 def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
     """Semantic search using vector embeddings with optional full-text hybrid search.
@@ -537,55 +854,22 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
                 "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
             }
 
-        from mcp_memory.embeddings import serialize_f32
-        from mcp_memory.scoring import (
-            EXPANSION_FACTOR,
-            RoutingStrategy,
-            detect_query_type,
-            rank_candidates,
-            rank_hybrid_candidates,
-            rank_with_routing_strategy,
-            reciprocal_rank_fusion,
-        )
+        from mcp_memory.scoring import RoutingStrategy, detect_query_type
 
-        # --- A/B Testing: Determine treatment ---
+        # Determine treatment and routing
         treatment = _get_treatment(query)
-
-        # --- Query Routing: Detect strategy for limbic queries ---
         routing_strategy = None
         if treatment == 1:
             routing_strategy = detect_query_type(query, limit)
             logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
 
-        # --- Step 1: Semantic KNN search ---
-        query_vector = engine.encode([query], task="query")
-        query_bytes = serialize_f32(query_vector[0])
-        expanded_limit = limit * EXPANSION_FACTOR
-        knn_results = store.search_embeddings(query_bytes, limit=expanded_limit)
-
+        # Execute search
+        knn_results, fts_results, merged, candidate_ids, use_hybrid = _execute_hybrid_search(query, engine, limit)
         if not knn_results:
             return {"results": []}
 
-        # --- Step 2: FTS5 full-text search (best-effort) ---
-        fts_results = store.search_fts(query, limit=expanded_limit)
-
-        # --- Step 3: Merge via RRF (hybrid) or pure semantic (fallback) ---
-        use_hybrid = len(fts_results) > 0
-
-        if use_hybrid:
-            # RRF merge of semantic + FTS5 rankings
-            merged = reciprocal_rank_fusion(knn_results, fts_results)
-            # Collect all candidate IDs from merged results
-            candidate_ids = [r["entity_id"] for r in merged]
-        else:
-            # Pure semantic — use original KNN results
-            merged = None
-            candidate_ids = [r["entity_id"] for r in knn_results]
-
-        # --- SHADOW MODE: Compute baseline ranking for A/B comparison ---
+        # Collect data
         baseline_ranked = _compute_baseline_ranking(knn_results, candidate_ids)
-
-        # Prepare limbic data for logging (needed for both treatments)
         access_data = store.get_access_data(candidate_ids)
         degree_data = store.get_entity_degrees(candidate_ids)
         cooc_data = store.get_co_occurrences(candidate_ids)
@@ -597,16 +881,14 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             if row:
                 entity_created[eid] = row["created_at"]
 
-        # --- SHADOW MODE: Log to database (best-effort, non-blocking) ---
+        # Log shadow event
         shadow_start_time = time.perf_counter()
-
         try:
-            # Log event
             event_id = store.log_search_event(
                 query_text=query,
                 treatment=treatment,
                 k_limit=limit,
-                num_results=None,  # Will update after ranking
+                num_results=None,
                 duration_ms=None,
                 engine_used="limbic" if treatment == 1 else "baseline",
             )
@@ -614,261 +896,26 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             logger.warning("Shadow mode event logging failed: %s", e)
             event_id = None
 
-        # --- Step 4: Re-rank based on treatment ---
-        if treatment == 0:
-            # BASELINE: Use cosine-only ranking (no limbic scoring)
-            ranked = baseline_ranked[:limit]
-        else:
-            # LIMBIC: Apply limbic re-ranking with dynamic routing
-            if routing_strategy == RoutingStrategy.HYBRID_BALANCED:
-                # For balanced queries, use limbic scoring as-is (already ~50/50 conceptually)
-                if use_hybrid:
-                    ranked = rank_hybrid_candidates(
-                        merged_results=merged,
-                        access_data=access_data,
-                        degree_data=degree_data,
-                        cooc_data=cooc_data,
-                        entity_created=entity_created,
-                        limit=limit,
-                        access_days_data=access_days_data,
-                    )
-                else:
-                    ranked = rank_candidates(
-                        knn_results=knn_results,
-                        access_data=access_data,
-                        degree_data=degree_data,
-                        cooc_data=cooc_data,
-                        entity_created=entity_created,
-                        limit=limit,
-                        access_days_data=access_days_data,
-                    )
-            elif routing_strategy in (
-                RoutingStrategy.COSINE_HEAVY,
-                RoutingStrategy.LIMBIC_HEAVY,
-            ):
-                # Apply weighted blending of cosine and limbic
-                if use_hybrid:
-                    ranked = rank_with_routing_strategy(
-                        merged_results=merged,
-                        access_data=access_data,
-                        degree_data=degree_data,
-                        cooc_data=cooc_data,
-                        entity_created=entity_created,
-                        limit=limit,
-                        strategy=routing_strategy,
-                        access_days_data=access_days_data,
-                    )
-                else:
-                    # For pure semantic, wrap knn_results in format expected
-                    knn_for_routing = [
-                        {
-                            "entity_id": r["entity_id"],
-                            "distance": r["distance"],
-                            "rrf_score": 1.0,
-                        }
-                        for r in knn_results
-                    ]
-                    ranked = rank_with_routing_strategy(
-                        merged_results=knn_for_routing,
-                        access_data=access_data,
-                        degree_data=degree_data,
-                        cooc_data=cooc_data,
-                        entity_created=entity_created,
-                        limit=limit,
-                        strategy=routing_strategy,
-                        access_days_data=access_days_data,
-                    )
-            else:
-                # Fallback (shouldn't happen): use original limbic scoring
-                if use_hybrid:
-                    ranked = rank_hybrid_candidates(
-                        merged_results=merged,
-                        access_data=access_data,
-                        degree_data=degree_data,
-                        cooc_data=cooc_data,
-                        entity_created=entity_created,
-                        limit=limit,
-                        access_days_data=access_days_data,
-                    )
-                else:
-                    ranked = rank_candidates(
-                        knn_results=knn_results,
-                        access_data=access_data,
-                        degree_data=degree_data,
-                        cooc_data=cooc_data,
-                        entity_created=entity_created,
-                        limit=limit,
-                        access_days_data=access_days_data,
-                    )
+        # Rank and apply deboosts
+        ranked = _rank_candidates(
+            treatment, routing_strategy, knn_results, merged, use_hybrid,
+            access_data, degree_data, cooc_data, entity_created, access_days_data, limit,
+            baseline_ranked,
+        )
+        ranked = _apply_deboosts(ranked, treatment)
 
-        # --- Status de-boost: apply multiplier to limbic_score based on entity status ---
-        STATUS_MULTIPLIERS = {
-            "activo": 1.0,
-            "pausado": 0.85,
-            "completado": 0.7,
-            "archivado": 0.5,
-        }
-        if treatment == 1:
-            for item in ranked:
-                eid = item["entity_id"]
-                row = store.get_entity_by_id(eid)
-                if row:
-                    status = row.get("status", "activo")
-                    multiplier = STATUS_MULTIPLIERS.get(status, 1.0)
-                    if multiplier < 1.0 and "limbic_score" in item:
-                        item["limbic_score"] *= multiplier
+        # Build output
+        output, top_k_ids = _build_search_output(ranked, treatment, routing_strategy, use_hybrid)
 
-        # --- Build output based on treatment ---
-        output = []
-        top_k_ids = []
-
-        if treatment == 0:
-            # BASELINE output: cosine-only ranking, no limbic scores
-            for rank_pos, item in enumerate(ranked):
-                eid = item["entity_id"]
-                row = store.get_entity_by_id(eid)
-                if not row:
-                    continue
-
-                obs = store.get_observations(eid)
-                result_item = {
-                    "name": row["name"],
-                    "entityType": row["entity_type"],
-                    "observations": obs,
-                    "distance": round(1.0 - item.get("cosine_sim", 0.0), 4),
-                    "treatment": "baseline",
-                }
-
-                # Add cosine_sim for baseline
-                result_item["cosine_sim"] = round(item.get("cosine_sim", 0.0), 4)
-
-                output.append(result_item)
-                top_k_ids.append(eid)
-        else:
-            # LIMBIC output: full scoring details
-            for item in ranked:
-                eid = item["entity_id"]
-                row = store.get_entity_by_id(eid)
-                if not row:
-                    continue
-
-                obs = store.get_observations(eid)
-                result_item = {
-                    "name": row["name"],
-                    "entityType": row["entity_type"],
-                    "observations": obs,
-                    "limbic_score": round(item.get("limbic_score", 0.0), 4),
-                    "scoring": {
-                        "importance": round(item.get("importance", 0.0), 4),
-                        "temporal_factor": round(item.get("temporal_factor", 1.0), 4),
-                        "cooc_boost": round(item.get("cooc_boost", 0.0), 4),
-                    },
-                    "routing_strategy": item.get(
-                        "routing_strategy",
-                        routing_strategy.value
-                        if routing_strategy
-                        else "hybrid_balanced",
-                    ),
-                }
-
-                # Add distance if available (semantic results have it, FTS-only don't)
-                if item.get("distance") is not None:
-                    result_item["distance"] = round(item["distance"], 4)
-
-                # Add rrf_score if hybrid mode
-                if use_hybrid and item.get("rrf_score") is not None:
-                    result_item["rrf_score"] = round(item["rrf_score"], 6)
-
-                # De-boost metadata-heavy entities
-                try:
-                    obs_data = store.get_observations_with_ids(
-                        eid, exclude_superseded=True
-                    )
-                    if obs_data:
-                        metadata_ratio = sum(
-                            1 for o in obs_data if o.get("kind") == "metadata"
-                        ) / len(obs_data)
-                        if metadata_ratio > 0.5:  # Majority metadata
-                            result_item["limbic_score"] = round(
-                                result_item["limbic_score"] * 0.7, 4
-                            )
-                except Exception:
-                    pass  # Non-critical
-
-                output.append(result_item)
-                top_k_ids.append(eid)
-
-        # --- Update shadow mode logging with results ---
-        if event_id is not None:
-            try:
-                # Map entity_id -> baseline_rank for logging
-                baseline_map = {
-                    r["entity_id"]: r["baseline_rank"] for r in baseline_ranked
-                }
-
-                # Prepare results for logging (top-k only)
-                results_to_log = []
-                for rank_pos, rank_item in enumerate(ranked):
-                    eid = rank_item["entity_id"]
-                    row = store.get_entity_by_id(eid)
-                    if not row:
-                        continue
-
-                    log_entry = {
-                        "entity_id": eid,
-                        "entity_name": row["name"],
-                        "rank": rank_pos + 1,
-                        "baseline_rank": baseline_map.get(eid),
-                    }
-
-                    if treatment == 1:
-                        # LIMBIC: include full scoring details
-                        log_entry["limbic_score"] = rank_item.get("limbic_score", 0.0)
-                        log_entry["cosine_sim"] = max(
-                            0.0, 1.0 - rank_item.get("distance", 1.0)
-                        )
-                        log_entry["importance"] = rank_item.get("importance", 0.0)
-                        log_entry["temporal"] = rank_item.get("temporal_factor", 1.0)
-                        log_entry["cooc_boost"] = rank_item.get("cooc_boost", 0.0)
-                    else:
-                        # BASELINE: only cosine similarity
-                        log_entry["cosine_sim"] = rank_item.get("cosine_sim", 0.0)
-
-                    results_to_log.append(log_entry)
-
-                store.log_search_results(event_id, results_to_log)
-
-                # Update event with final count and duration
-                duration_ms = (time.perf_counter() - shadow_start_time) * 1000
-                try:
-                    store.update_search_event_completion(
-                        event_id=event_id,
-                        num_results=len(output),
-                        duration_ms=duration_ms,
-                        engine_used="limbic" if treatment == 1 else "baseline",
-                    )
-                except Exception:
-                    pass  # Non-critical
-
-            except Exception as e:
-                logger.warning("Shadow mode result logging failed: %s", e)
-
-        # --- Limbic: record access + co-occurrences for top-K (post-response) ---
-        if treatment == 1:
-            # Only record limbic tracking for limbic queries
-            try:
-                for eid in top_k_ids:
-                    store.record_access(eid)
-                if len(top_k_ids) >= 2:
-                    store.record_co_occurrences(top_k_ids)
-            except Exception as e:
-                logger.warning("Limbic tracking failed: %s", e)
+        # Log and track
+        _log_shadow_and_track(event_id, ranked, treatment, baseline_ranked, top_k_ids, shadow_start_time)
 
         return {"results": output}
 
     except Exception as e:
         logger.error("Error in search_semantic: %s", e)
         return {"error": str(e)}
+
 
 
 # ============================================================
