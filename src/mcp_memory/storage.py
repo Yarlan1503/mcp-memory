@@ -512,39 +512,32 @@ class MemoryStore:
         id_placeholders = ",".join("?" for _ in ids)
 
         with self.db:
-            try:
-                # 1. Delete embeddings (vec0 has no CASCADE support)
-                if self._vec_loaded:
-                    try:
-                        self.db.execute(
-                            f"DELETE FROM entity_embeddings WHERE rowid IN ({id_placeholders})",
-                            ids,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Could not delete embeddings for entities %s", ids
-                        )
+            # 1. Delete embeddings (vec0 has no CASCADE support)
+            if self._vec_loaded:
+                try:
+                    self.db.execute(
+                        f"DELETE FROM entity_embeddings WHERE rowid IN ({id_placeholders})",
+                        ids,
+                    )
+                except Exception:
+                    logger.warning("Could not delete embeddings for entities %s", ids)
 
-                # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
-                if self._fts_available:
-                    try:
-                        self.db.execute(
-                            f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
-                            ids,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Could not delete FTS entries for entities %s", ids
-                        )
+            # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
+            if self._fts_available:
+                try:
+                    self.db.execute(
+                        f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
+                        ids,
+                    )
+                except Exception:
+                    logger.warning("Could not delete FTS entries for entities %s", ids)
 
-                # 3. Delete entities (CASCADE takes care of observations & relations)
-                self.db.execute(
-                    f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
-                )
+            # 3. Delete entities (CASCADE takes care of observations & relations)
+            self.db.execute(
+                f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
+            )
 
-                return len(ids)
-            except Exception:
-                raise
+            return len(ids)
 
     def search_entities(self, query: str) -> list[dict]:
         """
@@ -986,20 +979,6 @@ class MemoryStore:
             self.db.rollback()
             logger.error("Failed to store embedding for entity %s: %s", entity_id, exc)
 
-    def delete_embedding(self, entity_id: int) -> None:
-        """DELETE embedding by rowid."""
-        if not self._vec_loaded:
-            return
-        try:
-            self.db.execute(
-                "DELETE FROM entity_embeddings WHERE rowid = ?",
-                (entity_id,),
-            )
-            self.db.commit()
-        except Exception as exc:
-            self.db.rollback()
-            logger.error("Failed to delete embedding for entity %s: %s", entity_id, exc)
-
     def search_embeddings(self, query_embedding: bytes, limit: int = 10) -> list[dict]:
         """KNN search. Returns list of {"entity_id": int, "distance": float}."""
         if not self._vec_loaded:
@@ -1373,24 +1352,6 @@ class MemoryStore:
                     r.get("baseline_rank"),
                 ),
             )
-        self.db.commit()
-
-    def log_implicit_feedback(
-        self,
-        event_id: int,
-        entity_id: int,
-        re_accessed: bool,
-        access_delta: int | None,
-        session_id: str | None,
-    ) -> None:
-        """Log implicit feedback for a search result."""
-        self.db.execute(
-            """
-            INSERT INTO implicit_feedback (event_id, entity_id, re_accessed, access_delta, session_id)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (event_id, entity_id, int(re_accessed), access_delta, session_id),
-        )
         self.db.commit()
 
     def update_search_event_completion(

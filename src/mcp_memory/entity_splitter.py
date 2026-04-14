@@ -20,7 +20,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from storage import MemoryStore
+    from mcp_memory.storage import MemoryStore
 
 logger = logging.getLogger(__name__)
 

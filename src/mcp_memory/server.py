@@ -15,7 +15,7 @@ from mcp_memory.entity_splitter import (
     find_all_split_candidates,
     _get_threshold,
 )
-from mcp_memory.models import EntityInput, EntityOutput, RelationInput, RelationOutput
+from mcp_memory.models import EntityInput, RelationInput
 from mcp_memory.storage import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,7 @@ def _entity_to_output(
 ) -> dict:
     """Convert DB row + observations to EntityOutput dict.
     Optionally includes relations with context, active, and ended_at."""
-    if observations and isinstance(observations[0], dict):
-        obs_list = observations
-    else:
-        # Legacy: list[str]
-        obs_list = observations
+    obs_list = observations
     output = {
         "name": row["name"],
         "entityType": row["entity_type"],
