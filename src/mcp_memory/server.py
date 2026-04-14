@@ -26,6 +26,14 @@ mcp = FastMCP("memory")
 store = MemoryStore()
 store.init_db()
 
+# ============================================================
+# Input size limits
+# ============================================================
+MAX_OBSERVATIONS_PER_CALL = 100
+MAX_ENTITIES_PER_CALL = 50
+MAX_OBSERVATION_LENGTH = 2000
+MAX_QUERY_LENGTH = 500
+
 
 def _get_engine() -> Any:
     """Get embedding engine instance (may be unavailable).
@@ -209,6 +217,17 @@ def add_observations(
         supersedes: Optional observation ID to supersede. The referenced obs
             will be marked as superseded, and the new obs will reference it."""
     try:
+        # Input validation
+        if len(observations) > MAX_OBSERVATIONS_PER_CALL:
+            return {
+                "error": f"Too many observations: {len(observations)} > {MAX_OBSERVATIONS_PER_CALL}. Split into smaller batches."
+            }
+        for i, obs in enumerate(observations):
+            if len(obs) > MAX_OBSERVATION_LENGTH:
+                return {
+                    "error": f"Observation {i} too long: {len(obs)} > {MAX_OBSERVATION_LENGTH} characters. Shorten or split the observation."
+                }
+
         entity = store.get_entity_by_name(name)
         if not entity:
             return {"error": f"Entity not found: {name}"}
@@ -243,6 +262,11 @@ def add_observations(
 def delete_entities(entityNames: list[str]) -> dict[str, Any]:
     """Delete entities and all their relations/observations."""
     try:
+        if len(entityNames) > MAX_ENTITIES_PER_CALL:
+            return {
+                "error": f"Too many entity names: {len(entityNames)} > {MAX_ENTITIES_PER_CALL}. Delete fewer entities at a time."
+            }
+
         deleted = []
         errors = []
 
@@ -350,6 +374,11 @@ def search_nodes(query: str) -> dict[str, Any]:
     start_time = time.perf_counter()
     event_id = None
     try:
+        if len(query) > MAX_QUERY_LENGTH:
+            return {
+                "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
+            }
+
         if not query.strip():
             return {"entities": []}
 
@@ -407,6 +436,11 @@ def open_nodes(
             If None or empty, include all kinds.
         include_superseded: If True, include superseded observations. Default False."""
     try:
+        if len(names) > MAX_ENTITIES_PER_CALL:
+            return {
+                "error": f"Too many entity names: {len(names)} > {MAX_ENTITIES_PER_CALL}. Request fewer entities at a time."
+            }
+
         results = []
         opened_ids = []
         for name in names:
@@ -860,6 +894,15 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
     then applies limbic re-ranking based on access patterns and co-occurrence.
     Requires the embedding model to be downloaded (run download_model.py first)."""
     try:
+        if len(query) > MAX_QUERY_LENGTH:
+            return {
+                "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
+            }
+        if limit > MAX_ENTITIES_PER_CALL:
+            return {
+                "error": f"Limit too high: {limit} > {MAX_ENTITIES_PER_CALL}. Request fewer results."
+            }
+
         engine = _get_engine()
         if not engine or not engine.available:
             return {
@@ -1400,6 +1443,15 @@ def search_reflections(
         limit: Max results (default 10).
     """
     try:
+        if len(query) > MAX_QUERY_LENGTH:
+            return {
+                "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
+            }
+        if limit > MAX_ENTITIES_PER_CALL:
+            return {
+                "error": f"Limit too high: {limit} > {MAX_ENTITIES_PER_CALL}. Request fewer results."
+            }
+
         engine = _get_engine()
         if not engine or not engine.available:
             return {
