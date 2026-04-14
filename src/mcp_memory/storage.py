@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from mcp_memory.retry import retry_on_locked
+
 logger = logging.getLogger(__name__)
 
 # --- Phase 3: Inverse relation map ---
@@ -257,6 +259,7 @@ class MemoryStore:
         self._migrate_status_column()
         self._migrate_relation_fields()
         self._migrate_relation_types()
+        self._add_observation_superseded_index()
 
         # --- Phase 4: Reflections table ---
         cur.execute(
@@ -432,10 +435,23 @@ class MemoryStore:
         except Exception as exc:
             logger.warning("Failed to migrate relation types: %s", exc)
 
+    def _add_observation_superseded_index(self) -> None:
+        """Idempotent migration: create composite index on observations(entity_id, superseded_at)."""
+        try:
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_entity_superseded "
+                "ON observations(entity_id, superseded_at)"
+            )
+            self.db.commit()
+            logger.info("Composite index idx_obs_entity_superseded verified.")
+        except Exception as exc:
+            logger.warning("Failed to create composite index: %s", exc)
+
     # ------------------------------------------------------------------
     # Entity CRUD
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def upsert_entity(self, name: str, entity_type: str, status: str = "activo") -> int:
         """INSERT or UPDATE entity. Returns entity_id. Updates updated_at."""
         self.db.execute(
@@ -489,6 +505,7 @@ class MemoryStore:
             entity["observations"] = self.get_observations(entity["id"])
         return entities
 
+    @retry_on_locked
     def delete_entities_by_names(self, names: list[str]) -> int:
         """
         CASCADE delete. Returns count of deleted.
@@ -566,6 +583,7 @@ class MemoryStore:
     # Observation CRUD
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def add_observations(
         self,
         entity_id: int,
@@ -773,6 +791,7 @@ class MemoryStore:
             for r in rows
         ]
 
+    @retry_on_locked
     def delete_observations(self, entity_id: int, observations: list[str]) -> int:
         """DELETE by exact content match. Returns count deleted."""
         if not observations:
@@ -790,6 +809,7 @@ class MemoryStore:
     # Relation CRUD
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def create_relation(
         self,
         from_entity_id: int,
@@ -817,6 +837,7 @@ class MemoryStore:
             # UNIQUE constraint violated -> already exists
             return False
 
+    @retry_on_locked
     def _ensure_inverse_relation(
         self,
         from_id: int,
@@ -851,6 +872,7 @@ class MemoryStore:
             # Race condition or already exists — ignore
             pass
 
+    @retry_on_locked
     def _end_relation(self, relation_id: int) -> bool:
         """Deactivate a relation by setting active=0 and ended_at.
         Returns True if the relation was found and updated, False otherwise."""
@@ -872,6 +894,7 @@ class MemoryStore:
             return None
         return dict(row)
 
+    @retry_on_locked
     def delete_relation(
         self, from_entity_id: int, to_entity_id: int, relation_type: str
     ) -> bool:
@@ -960,6 +983,7 @@ class MemoryStore:
     # Embedding ops
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def store_embedding(self, entity_id: int, embedding: bytes) -> None:
         """DELETE + INSERT embedding (vec0 doesn't support OR REPLACE). entity_id is rowid in vec0."""
         if not self._vec_loaded:
@@ -1014,6 +1038,7 @@ class MemoryStore:
         ).fetchone()
         return row["value"] if row else None
 
+    @retry_on_locked
     def set_metadata(self, key: str, value: str) -> None:
         """Set metadata value (INSERT OR REPLACE)."""
         self.db.execute(
@@ -1026,6 +1051,7 @@ class MemoryStore:
     # Limbic: Access tracking
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def init_access(self, entity_id: int) -> None:
         """Initialize access tracking for a new entity (access_count=1)."""
         self.db.execute(
@@ -1034,6 +1060,7 @@ class MemoryStore:
         )
         self.db.commit()
 
+    @retry_on_locked
     def record_access(self, entity_id: int) -> None:
         """Record an access event: increment count and update last_access.
 
@@ -1132,6 +1159,7 @@ class MemoryStore:
     # Limbic: Co-occurrence tracking
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def record_co_occurrences(self, entity_ids: list[int]) -> None:
         """Record co-occurrences for all unique pairs of entity IDs.
         Canonical ordering: entity_a_id < entity_b_id always."""
@@ -1183,6 +1211,7 @@ class MemoryStore:
     # Limbic: FTS5 full-text search
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def _sync_fts(self, entity_id: int) -> None:
         """Rebuild FTS index entry for an entity from current DB state.
         Idempotent: INSERT OR REPLACE. No-op if FTS not available."""
@@ -1212,6 +1241,7 @@ class MemoryStore:
         except Exception as exc:
             logger.warning("FTS sync failed for entity %s: %s", entity_id, exc)
 
+    @retry_on_locked
     def _delete_fts(self, entity_id: int) -> None:
         """Delete FTS index entry for an entity."""
         if not self._fts_available:
@@ -1222,6 +1252,7 @@ class MemoryStore:
         except Exception as exc:
             logger.warning("FTS delete failed for entity %s: %s", entity_id, exc)
 
+    @retry_on_locked
     def _backfill_fts(self) -> None:
         """Populate FTS index from all existing entities. Called from init_db."""
         try:
@@ -1291,6 +1322,7 @@ class MemoryStore:
     # A/B Testing: Search event logging
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def log_search_event(
         self,
         query_text: str,
@@ -1322,6 +1354,7 @@ class MemoryStore:
         self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
+    @retry_on_locked
     def log_search_results(
         self,
         event_id: int,
@@ -1354,6 +1387,7 @@ class MemoryStore:
             )
         self.db.commit()
 
+    @retry_on_locked
     def update_search_event_completion(
         self,
         event_id: int,
@@ -1382,6 +1416,7 @@ class MemoryStore:
     # Phase 4: Reflections CRUD
     # ------------------------------------------------------------------
 
+    @retry_on_locked
     def add_reflection(
         self,
         target_type: str,
