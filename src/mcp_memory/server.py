@@ -676,9 +676,16 @@ def _apply_deboosts(ranked: list[dict], treatment: int) -> list[dict]:
     }
 
     if treatment == 1:
+        # Batch prefetch: entities + obs_with_ids (2 queries total instead of 2N)
+        entity_ids = [item["entity_id"] for item in ranked]
+        entities_map = store.get_entities_batch(entity_ids)
+        obs_map = store.get_observations_with_ids_batch(
+            entity_ids, exclude_superseded=True
+        )
+
         for item in ranked:
             eid = item["entity_id"]
-            row = store.get_entity_by_id(eid)
+            row = entities_map.get(eid)
             if row:
                 status = row.get("status", "activo")
                 multiplier = STATUS_MULTIPLIERS.get(status, 1.0)
@@ -687,9 +694,7 @@ def _apply_deboosts(ranked: list[dict], treatment: int) -> list[dict]:
 
             # De-boost metadata-heavy entities
             try:
-                obs_data = store.get_observations_with_ids(
-                    eid, exclude_superseded=True
-                )
+                obs_data = obs_map.get(eid, [])
                 if obs_data:
                     metadata_ratio = sum(
                         1 for o in obs_data if o.get("kind") == "metadata"
@@ -717,14 +722,19 @@ def _build_search_output(
     output = []
     top_k_ids = []
 
+    # Batch prefetch: entities + observations (2 queries total instead of 2N)
+    entity_ids = [item["entity_id"] for item in ranked]
+    entities_map = store.get_entities_batch(entity_ids)
+    obs_map = store.get_observations_batch(entity_ids)
+
     if treatment == 0:
         for item in ranked:
             eid = item["entity_id"]
-            row = store.get_entity_by_id(eid)
+            row = entities_map.get(eid)
             if not row:
                 continue
 
-            obs = store.get_observations(eid)
+            obs = obs_map.get(eid, [])
             result_item = {
                 "name": row["name"],
                 "entityType": row["entity_type"],
@@ -740,11 +750,11 @@ def _build_search_output(
     else:
         for item in ranked:
             eid = item["entity_id"]
-            row = store.get_entity_by_id(eid)
+            row = entities_map.get(eid)
             if not row:
                 continue
 
-            obs = store.get_observations(eid)
+            obs = obs_map.get(eid, [])
             result_item = {
                 "name": row["name"],
                 "entityType": row["entity_type"],
@@ -784,14 +794,16 @@ def _log_shadow_and_track(
     """Log shadow mode results and record limbic access tracking."""
     if event_id is not None:
         try:
-            baseline_map = {
-                r["entity_id"]: r["baseline_rank"] for r in baseline_ranked
-            }
+            baseline_map = {r["entity_id"]: r["baseline_rank"] for r in baseline_ranked}
+
+            # Batch prefetch entity names
+            log_entity_ids = [r["entity_id"] for r in ranked]
+            entities_map = store.get_entities_batch(log_entity_ids)
 
             results_to_log = []
             for rank_pos, rank_item in enumerate(ranked):
                 eid = rank_item["entity_id"]
-                row = store.get_entity_by_id(eid)
+                row = entities_map.get(eid)
                 if not row:
                     continue
 
@@ -864,7 +876,9 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
 
         # Execute search
-        knn_results, fts_results, merged, candidate_ids, use_hybrid = _execute_hybrid_search(query, engine, limit)
+        knn_results, fts_results, merged, candidate_ids, use_hybrid = (
+            _execute_hybrid_search(query, engine, limit)
+        )
         if not knn_results:
             return {"results": []}
 
@@ -898,24 +912,36 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
 
         # Rank and apply deboosts
         ranked = _rank_candidates(
-            treatment, routing_strategy, knn_results, merged, use_hybrid,
-            access_data, degree_data, cooc_data, entity_created, access_days_data, limit,
+            treatment,
+            routing_strategy,
+            knn_results,
+            merged,
+            use_hybrid,
+            access_data,
+            degree_data,
+            cooc_data,
+            entity_created,
+            access_days_data,
+            limit,
             baseline_ranked,
         )
         ranked = _apply_deboosts(ranked, treatment)
 
         # Build output
-        output, top_k_ids = _build_search_output(ranked, treatment, routing_strategy, use_hybrid)
+        output, top_k_ids = _build_search_output(
+            ranked, treatment, routing_strategy, use_hybrid
+        )
 
         # Log and track
-        _log_shadow_and_track(event_id, ranked, treatment, baseline_ranked, top_k_ids, shadow_start_time)
+        _log_shadow_and_track(
+            event_id, ranked, treatment, baseline_ranked, top_k_ids, shadow_start_time
+        )
 
         return {"results": output}
 
     except Exception as e:
         logger.error("Error in search_semantic: %s", e)
         return {"error": str(e)}
-
 
 
 # ============================================================

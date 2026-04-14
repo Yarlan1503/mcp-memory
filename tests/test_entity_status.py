@@ -277,7 +277,20 @@ class TestServerTools:
                 "status": "activo" if eid == 1 else "archivado",
                 "created_at": "2024-01-01",
             }
+            mock_store.get_entities_batch.side_effect = lambda ids: {
+                eid: {
+                    "id": eid,
+                    "name": f"Entity{eid}",
+                    "entity_type": "Test",
+                    "status": "activo" if eid == 1 else "archivado",
+                    "created_at": "2024-01-01",
+                }
+                for eid in ids
+            }
             mock_store.get_observations.return_value = ["obs1"]
+            mock_store.get_observations_batch.side_effect = lambda ids: {
+                eid: ["obs1"] for eid in ids
+            }
             mock_store.get_observations_with_ids.return_value = [
                 {
                     "id": 1,
@@ -288,6 +301,19 @@ class TestServerTools:
                     "superseded_at": None,
                 }
             ]
+            mock_store.get_observations_with_ids_batch.side_effect = lambda ids, **kw: {
+                eid: [
+                    {
+                        "id": 1,
+                        "content": "obs1",
+                        "similarity_flag": 0,
+                        "kind": "generic",
+                        "supersedes": None,
+                        "superseded_at": None,
+                    }
+                ]
+                for eid in ids
+            }
             mock_store.log_search_event.return_value = 1
 
             with (

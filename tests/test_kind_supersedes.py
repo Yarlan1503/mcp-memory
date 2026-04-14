@@ -390,7 +390,18 @@ class TestServerTools:
                 "entity_type": "Test",
                 "created_at": "2024-01-01",
             }
+            mock_store.get_entities_batch.return_value = {
+                1: {
+                    "id": 1,
+                    "name": "MetaEntity",
+                    "entity_type": "Test",
+                    "created_at": "2024-01-01",
+                }
+            }
             mock_store.get_observations.return_value = ["meta1", "meta2", "meta3"]
+            mock_store.get_observations_batch.return_value = {
+                1: ["meta1", "meta2", "meta3"]
+            }
             # 4 metadata, 1 generic → 80% metadata → de-boosted
             mock_store.get_observations_with_ids.return_value = [
                 {
@@ -434,6 +445,50 @@ class TestServerTools:
                     "superseded_at": None,
                 },
             ]
+            mock_store.get_observations_with_ids_batch.return_value = {
+                1: [
+                    {
+                        "id": 1,
+                        "content": "m1",
+                        "similarity_flag": 0,
+                        "kind": "metadata",
+                        "supersedes": None,
+                        "superseded_at": None,
+                    },
+                    {
+                        "id": 2,
+                        "content": "m2",
+                        "similarity_flag": 0,
+                        "kind": "metadata",
+                        "supersedes": None,
+                        "superseded_at": None,
+                    },
+                    {
+                        "id": 3,
+                        "content": "m3",
+                        "similarity_flag": 0,
+                        "kind": "metadata",
+                        "supersedes": None,
+                        "superseded_at": None,
+                    },
+                    {
+                        "id": 4,
+                        "content": "m4",
+                        "similarity_flag": 0,
+                        "kind": "metadata",
+                        "supersedes": None,
+                        "superseded_at": None,
+                    },
+                    {
+                        "id": 5,
+                        "content": "g1",
+                        "similarity_flag": 0,
+                        "kind": "generic",
+                        "supersedes": None,
+                        "superseded_at": None,
+                    },
+                ]
+            }
             mock_store.log_search_event.return_value = 1
 
             # Patch scoring imports that happen inside search_semantic
