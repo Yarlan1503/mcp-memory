@@ -494,16 +494,32 @@ class MemoryStore:
         return dict(row)
 
     def get_all_entities(self) -> list[dict]:
-        """All entities with their observations."""
-        entities = [
-            dict(r)
-            for r in self.db.execute(
-                "SELECT id, name, entity_type, status, created_at, updated_at FROM entities"
-            ).fetchall()
-        ]
-        for entity in entities:
-            entity["observations"] = self.get_observations(entity["id"])
-        return entities
+        """All entities with their observations. Single query via LEFT JOIN."""
+        rows = self.db.execute(
+            "SELECT e.id, e.name, e.entity_type, e.status, e.created_at, e.updated_at, "
+            "o.content "
+            "FROM entities e "
+            "LEFT JOIN observations o ON o.entity_id = e.id AND o.superseded_at IS NULL "
+            "ORDER BY e.id, o.id"
+        ).fetchall()
+
+        entities_map: dict[int, dict] = {}
+        for row in rows:
+            eid = row["id"]
+            if eid not in entities_map:
+                entities_map[eid] = {
+                    "id": eid,
+                    "name": row["name"],
+                    "entity_type": row["entity_type"],
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "observations": [],
+                }
+            if row["content"] is not None:
+                entities_map[eid]["observations"].append(row["content"])
+
+        return list(entities_map.values())
 
     @retry_on_locked
     def delete_entities_by_names(self, names: list[str]) -> int:
@@ -560,6 +576,7 @@ class MemoryStore:
         """
         LIKE search on name, entity_type, and observations.content.
         Returns entities with their observations.
+        Uses 2 queries instead of N+1.
         """
         pattern = f"%{query}%"
         rows = self.db.execute(
@@ -572,12 +589,13 @@ class MemoryStore:
             (pattern, pattern, pattern),
         ).fetchall()
 
-        results: list[dict] = []
-        for row in rows:
-            entity = dict(row)
-            entity["observations"] = self.get_observations(entity["id"])
-            results.append(entity)
-        return results
+        if not rows:
+            return []
+
+        entity_ids = [r["id"] for r in rows]
+        obs_map = self.get_observations_batch(entity_ids)
+
+        return [{**dict(r), "observations": obs_map.get(r["id"], [])} for r in rows]
 
     # ------------------------------------------------------------------
     # Observation CRUD
@@ -790,6 +808,89 @@ class MemoryStore:
             }
             for r in rows
         ]
+
+    def get_observations_batch(
+        self, entity_ids: list[int], exclude_superseded: bool = True
+    ) -> dict[int, list[str]]:
+        """Get observations for multiple entities in a single query.
+        Returns dict mapping entity_id -> list of observation content strings."""
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        if exclude_superseded:
+            rows = self.db.execute(
+                f"SELECT entity_id, content FROM observations "
+                f"WHERE entity_id IN ({placeholders}) AND superseded_at IS NULL "
+                f"ORDER BY entity_id, id",
+                entity_ids,
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                f"SELECT entity_id, content FROM observations "
+                f"WHERE entity_id IN ({placeholders}) "
+                f"ORDER BY entity_id, id",
+                entity_ids,
+            ).fetchall()
+
+        result: dict[int, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["entity_id"], []).append(row["content"])
+        return result
+
+    def get_observations_with_ids_batch(
+        self, entity_ids: list[int], exclude_superseded: bool = True
+    ) -> dict[int, list[dict]]:
+        """Get full observation dicts for multiple entities in a single query.
+        Returns dict mapping entity_id -> list of {id, content, similarity_flag,
+        kind, supersedes, superseded_at}."""
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        if exclude_superseded:
+            rows = self.db.execute(
+                f"SELECT id, entity_id, content, similarity_flag, kind, supersedes, superseded_at "
+                f"FROM observations "
+                f"WHERE entity_id IN ({placeholders}) AND superseded_at IS NULL "
+                f"ORDER BY entity_id, id",
+                entity_ids,
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                f"SELECT id, entity_id, content, similarity_flag, kind, supersedes, superseded_at "
+                f"FROM observations "
+                f"WHERE entity_id IN ({placeholders}) "
+                f"ORDER BY entity_id, id",
+                entity_ids,
+            ).fetchall()
+
+        result: dict[int, list[dict]] = {}
+        for r in rows:
+            eid = r["entity_id"]
+            result.setdefault(eid, []).append(
+                {
+                    "id": r["id"],
+                    "content": r["content"],
+                    "similarity_flag": r["similarity_flag"],
+                    "kind": r["kind"] if r["kind"] is not None else "generic",
+                    "supersedes": r["supersedes"],
+                    "superseded_at": r["superseded_at"],
+                }
+            )
+        return result
+
+    def get_entities_batch(self, entity_ids: list[int]) -> dict[int, dict]:
+        """Get entity data for multiple IDs in a single query.
+        Returns dict mapping entity_id -> {id, name, entity_type, status,
+        created_at, updated_at}."""
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"SELECT id, name, entity_type, status, created_at, updated_at "
+            f"FROM entities WHERE id IN ({placeholders})",
+            entity_ids,
+        ).fetchall()
+        return {r["id"]: dict(r) for r in rows}
 
     @retry_on_locked
     def delete_observations(self, entity_id: int, observations: list[str]) -> int:
@@ -1442,7 +1543,7 @@ class MemoryStore:
         if mood is not None and mood not in VALID_MOODS:
             logger.warning("Invalid mood: %s", mood)
             return None
-        if target_type in ("entity", "session", "relation") and target_id is None:
+        if target_type in ("entity", "relation") and target_id is None:
             logger.warning("target_id required for target_type '%s'", target_type)
             return None
         if target_type == "global" and target_id is not None:

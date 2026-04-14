@@ -103,6 +103,38 @@ class TestAddReflection:
         result = store_with_schema.add_reflection("entity", None, "nolan", "test")
         assert result is None
 
+    def test_add_reflection_session_without_id(self, store_with_schema):
+        """Session reflection without target_id is valid (like global)."""
+        result = store_with_schema.add_reflection(
+            "session", None, "sofia", "Sesión productiva", "satisfaccion"
+        )
+        assert result is not None
+        assert result["target_type"] == "session"
+        assert result["target_id"] is None
+        assert result["author"] == "sofia"
+        assert result["content"] == "Sesión productiva"
+        assert result["mood"] == "satisfaccion"
+
+    def test_add_reflection_session_with_id(self, store_with_schema):
+        """Session reflection with specific target_id also works."""
+        sid = store_with_schema.upsert_entity("Sesion 2026-01-01", "Sesion")
+        result = store_with_schema.add_reflection(
+            "session", sid, "sofia", "Sesión con ID específico"
+        )
+        assert result is not None
+        assert result["target_type"] == "session"
+        assert result["target_id"] == sid
+
+    def test_add_reflection_entity_still_requires_id(self, store_with_schema):
+        """Entity reflection still requires target_id (no regression)."""
+        result = store_with_schema.add_reflection("entity", None, "nolan", "test")
+        assert result is None
+
+    def test_add_reflection_relation_still_requires_id(self, store_with_schema):
+        """Relation reflection still requires target_id (no regression)."""
+        result = store_with_schema.add_reflection("relation", None, "nolan", "test")
+        assert result is None
+
 
 # ============================================================
 # 3. Embeddings and FTS
@@ -507,6 +539,25 @@ class TestSearchReflectionsRecency:
         result = search_reflections("xyznonexistent12345")
         assert "error" not in result
         assert result["results"] == []
+
+    def test_search_reflections_finds_session_without_id(
+        self, store_with_schema, monkeypatch
+    ):
+        """search_reflections can find session reflections without target_id."""
+        import mcp_memory.server as server_module
+        from mcp_memory.server import search_reflections
+
+        monkeypatch.setattr(server_module, "store", store_with_schema)
+
+        store_with_schema.add_reflection(
+            "session", None, "sofia", "Reflexión sobre la sesión de hoy", "satisfaccion"
+        )
+        result = search_reflections("sesión de hoy")
+        assert "error" not in result
+        assert len(result["results"]) >= 1
+        found = result["results"][0]
+        assert found["target_type"] == "session"
+        assert found["target_id"] is None
 
 
 # ============================================================
