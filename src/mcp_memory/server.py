@@ -101,6 +101,23 @@ def create_entities(entities: list[dict[str, Any]]) -> dict[str, Any]:
     If an entity already exists, merge observations (don't overwrite).
     Returns the created/updated entities."""
     try:
+        # Input validation
+        if len(entities) > MAX_ENTITIES_PER_CALL:
+            return {
+                "error": f"Too many entities: {len(entities)} > {MAX_ENTITIES_PER_CALL}. Create fewer entities at a time."
+            }
+        for i, entity_dict in enumerate(entities):
+            obs_list = entity_dict.get("observations", [])
+            if len(obs_list) > MAX_OBSERVATIONS_PER_CALL:
+                return {
+                    "error": f"Entity {i} has too many observations: {len(obs_list)} > {MAX_OBSERVATIONS_PER_CALL}. Split into smaller batches."
+                }
+            for j, obs in enumerate(obs_list):
+                if len(obs) > MAX_OBSERVATION_LENGTH:
+                    return {
+                        "error": f"Entity {i}, observation {j} too long: {len(obs)} > {MAX_OBSERVATION_LENGTH} characters. Shorten or split the observation."
+                    }
+
         results = []
         for entity_dict in entities:
             parsed = EntityInput.model_validate(entity_dict)
@@ -510,7 +527,6 @@ BASELINE_PROBABILITY = 0.1  # 10% of queries are baseline (treatment=0)
 
 def _compute_baseline_ranking(
     knn_results: list[dict],
-    candidate_ids: list[int],
 ) -> list[dict]:
     """Compute baseline ranking (cosine-only) for A/B comparison.
 
@@ -926,17 +942,16 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             return {"results": []}
 
         # Collect data
-        baseline_ranked = _compute_baseline_ranking(knn_results, candidate_ids)
+        baseline_ranked = _compute_baseline_ranking(knn_results)
         access_data = store.get_access_data(candidate_ids)
         degree_data = store.get_entity_degrees(candidate_ids)
         cooc_data = store.get_co_occurrences(candidate_ids)
         access_days_data = store.get_access_days(candidate_ids)
 
-        entity_created: dict[int, str] = {}
-        for eid in candidate_ids:
-            row = store.get_entity_by_id(eid)
-            if row:
-                entity_created[eid] = row["created_at"]
+        entity_created = {
+            eid: row["created_at"]
+            for eid, row in store.get_entities_batch(candidate_ids).items()
+        }
 
         # Log shadow event
         shadow_start_time = time.perf_counter()

@@ -135,6 +135,11 @@ class TestAddReflection:
         result = store_with_schema.add_reflection("relation", None, "nolan", "test")
         assert result is None
 
+    def test_add_reflection_global_rejects_target_id(self, store_with_schema):
+        """Global reflection with target_id should return None."""
+        result = store_with_schema.add_reflection("global", 123, "nolan", "test")
+        assert result is None
+
 
 # ============================================================
 # 3. Embeddings and FTS

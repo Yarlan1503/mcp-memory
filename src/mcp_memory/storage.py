@@ -1343,17 +1343,6 @@ class MemoryStore:
             logger.warning("FTS sync failed for entity %s: %s", entity_id, exc)
 
     @retry_on_locked
-    def _delete_fts(self, entity_id: int) -> None:
-        """Delete FTS index entry for an entity."""
-        if not self._fts_available:
-            return
-        try:
-            self.db.execute("DELETE FROM entity_fts WHERE rowid = ?", (entity_id,))
-            self.db.commit()
-        except Exception as exc:
-            logger.warning("FTS delete failed for entity %s: %s", entity_id, exc)
-
-    @retry_on_locked
     def _backfill_fts(self) -> None:
         """Populate FTS index from all existing entities. Called from init_db."""
         try:
