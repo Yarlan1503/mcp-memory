@@ -221,7 +221,7 @@ The output includes `limbic_score`, `scoring` (importance/temporal/cooc breakdow
 uv run pytest tests/ -v
 ```
 
-308 tests across 15 test files covering all tools, embeddings, scoring, and edge cases. Zero regressions.
+313 tests across 15 test files covering all tools, embeddings, scoring, and edge cases. Zero regressions.
 
 ## Requirements
 
