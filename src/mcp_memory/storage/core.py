@@ -1,6 +1,7 @@
 """Entity and observation CRUD operations for the MCP Memory knowledge graph."""
 
 import logging
+import sqlite3
 
 from mcp_memory.retry import retry_on_locked
 
@@ -188,7 +189,11 @@ class CoreMixin:
             return 0
 
         # Acquire write lock early to prevent contention during ONNX inference
-        self.db.execute("BEGIN IMMEDIATE")
+        # Skip if already in a transaction (e.g., called from execute_entity_split)
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            pass  # Already in a transaction — use existing lock
 
         # --- Handle supersedes logic ---
         if supersedes is not None:
