@@ -4,6 +4,7 @@ import re
 import shutil
 import struct
 import logging
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +119,7 @@ class EmbeddingEngine:
     """
 
     _instance: "EmbeddingEngine | None" = None
+    _lock: threading.Lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Singleton
@@ -128,7 +130,9 @@ class EmbeddingEngine:
         """Return the cached singleton.  ``available`` may be ``False``
         if the model files are missing on disk."""
         if cls._instance is None:
-            cls._instance = cls()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
         return cls._instance
 
     @classmethod

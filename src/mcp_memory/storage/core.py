@@ -187,6 +187,9 @@ class CoreMixin:
         if not observations:
             return 0
 
+        # Acquire write lock early to prevent contention during ONNX inference
+        self.db.execute("BEGIN IMMEDIATE")
+
         # --- Handle supersedes logic ---
         if supersedes is not None:
             # Verify the observation exists and belongs to this entity

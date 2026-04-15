@@ -62,7 +62,7 @@ class MemoryStore(
 
         # --- PRAGMAs (before any table creation) ---
         self.db.execute("PRAGMA journal_mode=WAL;")
-        self.db.execute("PRAGMA busy_timeout=5000;")
+        self.db.execute("PRAGMA busy_timeout=10000;")
         self.db.execute("PRAGMA synchronous=NORMAL;")
         self.db.execute("PRAGMA cache_size=-64000;")
         self.db.execute("PRAGMA temp_store=MEMORY;")

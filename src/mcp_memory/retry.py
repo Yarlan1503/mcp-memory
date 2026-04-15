@@ -35,6 +35,11 @@ def retry_on_locked(func):
                 if attempt == MAX_RETRIES:
                     raise
                 last_exc = exc
+                # Rollback any pending transaction before retrying
+                try:
+                    args[0].db.rollback()
+                except Exception:
+                    pass  # No transaction active or no .db attribute
                 delay = min(BASE_DELAY * (2**attempt), MAX_DELAY)
                 jitter = random.uniform(0, delay * 0.1)
                 total_delay = delay + jitter
