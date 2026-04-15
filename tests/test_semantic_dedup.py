@@ -307,7 +307,7 @@ class TestFindDuplicateObservations:
 
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=fake),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=fake),
         ):
             tool = self._import_tool()
             result = tool(entity_name="Test", threshold=0.85)
@@ -323,7 +323,7 @@ class TestFindDuplicateObservations:
         fake = FakeEmbeddingEngine()
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=fake),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=fake),
         ):
             tool = self._import_tool()
             result = tool(entity_name="Test", threshold=0.85)
@@ -345,7 +345,7 @@ class TestFindDuplicateObservations:
 
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=None),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=None),
         ):
             tool = self._import_tool()
             result = tool(entity_name="Test", threshold=0.85)
@@ -377,7 +377,7 @@ class TestFindDuplicateObservations:
 
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=fake),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=fake),
         ):
             tool = self._import_tool()
             result = tool(entity_name="Test", threshold=0.85)

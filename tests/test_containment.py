@@ -420,7 +420,7 @@ class TestFindDuplicateObservationsContainment:
 
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=fake),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=fake),
         ):
             tool = self._import_tool()
             result = tool(entity_name="Test", threshold=0.85, containment_threshold=0.7)
@@ -451,7 +451,7 @@ class TestFindDuplicateObservationsContainment:
 
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=fake),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=fake),
         ):
             tool = self._import_tool()
 
@@ -482,13 +482,12 @@ class TestFindDuplicateObservationsContainment:
 
         with (
             patch("mcp_memory.server.store", store),
-            patch("mcp_memory.server._get_engine", return_value=fake),
+            patch("mcp_memory.tools.entity_mgmt._get_engine", return_value=fake),
         ):
             tool = self._import_tool()
             result = tool(entity_name="Test", threshold=0.85, containment_threshold=0.7)
 
         if result["duplicates_found"] >= 1:
-            # Check the clusters contain both observations
             assert len(result["clusters"]) >= 1
             cluster_obs = result["clusters"][0]["observations"]
             contents = [o["content"] for o in cluster_obs]

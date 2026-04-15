@@ -367,7 +367,7 @@ class TestServerTools:
         from mcp_memory.scoring import RoutingStrategy
 
         # Mock the engine
-        with patch("mcp_memory.server._get_engine") as mock_engine_fn:
+        with patch("mcp_memory.tools.search._get_engine") as mock_engine_fn:
             mock_engine = MagicMock()
             mock_engine.available = True
             mock_engine.encode.return_value = MagicMock()  # query vector
@@ -496,7 +496,7 @@ class TestServerTools:
                 patch("mcp_memory.scoring.reciprocal_rank_fusion") as mock_rrf,
                 patch("mcp_memory.scoring.rank_candidates") as mock_rank,
                 patch("mcp_memory.scoring.detect_query_type") as mock_detect,
-                patch("mcp_memory.server._get_treatment", return_value=1),
+                patch("mcp_memory.tools.search._get_treatment", return_value=1),
             ):
                 mock_detect.return_value = RoutingStrategy.HYBRID_BALANCED
                 mock_rank.return_value = [

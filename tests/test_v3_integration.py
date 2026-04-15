@@ -149,7 +149,7 @@ class TestFullV3Flow:
         store.add_observations(e1, ["active obs"], kind="hallazgo")
         store.add_observations(e2, ["archived obs"], kind="generic")
 
-        with patch("mcp_memory.server._get_engine") as mock_engine_fn:
+        with patch("mcp_memory.tools.search._get_engine") as mock_engine_fn:
             mock_engine = MagicMock()
             mock_engine.available = True
             mock_engine_fn.return_value = mock_engine
@@ -196,7 +196,7 @@ class TestFullV3Flow:
             store.log_search_event = MagicMock(return_value=1)
 
             with (
-                patch("mcp_memory.server._get_treatment", return_value=1),
+                patch("mcp_memory.tools.search._get_treatment", return_value=1),
                 patch("mcp_memory.scoring.rank_candidates") as mock_rank,
                 patch("mcp_memory.scoring.detect_query_type") as mock_detect,
             ):
@@ -356,7 +356,7 @@ class TestDeterministicSearch:
 
         monkeypatch.setattr("mcp_memory.server.store", store)
 
-        with patch("mcp_memory.server._get_engine") as mock_engine_fn:
+        with patch("mcp_memory.tools.search._get_engine") as mock_engine_fn:
             mock_engine = MagicMock()
             mock_engine.available = True
             mock_engine_fn.return_value = mock_engine
@@ -364,7 +364,7 @@ class TestDeterministicSearch:
             store.upsert_entity("DeterministicEnt", "Test", status="activo")
 
             with (
-                patch("mcp_memory.server._get_treatment", return_value=1),
+                patch("mcp_memory.tools.search._get_treatment", return_value=1),
                 patch("mcp_memory.scoring.reciprocal_rank_fusion"),
                 patch("mcp_memory.scoring.rank_candidates") as mock_rank,
                 patch("mcp_memory.scoring.detect_query_type") as mock_detect,

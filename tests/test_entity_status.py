@@ -252,7 +252,7 @@ class TestServerTools:
         from mcp_memory.server import search_semantic
         from mcp_memory.scoring import RoutingStrategy
 
-        with patch("mcp_memory.server._get_engine") as mock_engine_fn:
+        with patch("mcp_memory.tools.search._get_engine") as mock_engine_fn:
             mock_engine = MagicMock()
             mock_engine.available = True
             mock_engine_fn.return_value = mock_engine
@@ -319,7 +319,7 @@ class TestServerTools:
             with (
                 patch("mcp_memory.scoring.rank_candidates") as mock_rank,
                 patch("mcp_memory.scoring.detect_query_type") as mock_detect,
-                patch("mcp_memory.server._get_treatment", return_value=1),
+                patch("mcp_memory.tools.search._get_treatment", return_value=1),
             ):
                 mock_detect.return_value = RoutingStrategy.HYBRID_BALANCED
                 # Both start with same limbic_score
