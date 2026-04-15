@@ -162,21 +162,33 @@ Inverse relations are auto-created for `contiene`/`parte_de` pairs.
 ## Architecture
 
 ```
-server.py (FastMCP)  <--  storage.py (SQLite + sqlite-vec + FTS5)
-                               |
-                         embeddings.py (ONNX Runtime)
-                               |
-                         sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-                         (384d, multilingual, cosine similarity)
-                               |
-                         scoring.py (Limbic Scoring + RRF)
-                         salience . temporal decay . co-occurrence
+server.py (97 lines)          — FastMCP init + tool registration
+├── tools/
+│   ├── core.py              — 6 CRUD tools (Anthropic-compatible)
+│   ├── search.py            — 3 search tools + ranking helpers
+│   ├── entity_mgmt.py       — 6 entity management tools
+│   ├── reflections.py       — 2 reflection tools
+│   └── relations.py         — 2 tools (migrate, end_relation)
+├── storage/                  — 7 mixins via multiple inheritance
+│   ├── __init__.py           — MemoryStore facade (134 lines)
+│   ├── schema.py            — SchemaMixin (migrations)
+│   ├── core.py              — CoreMixin (entity/obs CRUD)
+│   ├── relations.py         — RelationsMixin
+│   ├── search.py            — SearchMixin (FTS + embeddings)
+│   ├── access.py            — AccessMixin
+│   ├── reflections.py       — ReflectionsMixin
+│   └── consolidation.py     — ConsolidationMixin
+├── embeddings.py             — EmbeddingEngine (ONNX, lazy load)
+├── scoring.py                — Limbic Scoring + RRF
+├── entity_splitter.py        — TF-IDF entity splitting
+├── retry.py                  — retry_on_locked (concurrency)
+└── config.py                 — Input limits + A/B config
 ```
 
 - **Storage**: SQLite with WAL journaling, 5-second busy timeout, CASCADE deletes
 - **Embeddings**: Singleton ONNX model loaded once at startup, L2-normalized cosine search
 - **Limbic Scoring**: Re-ranks hybrid (KNN + FTS5) candidates using importance signals, temporal decay, co-occurrence patterns, and RRF scores -- transparent to the API
-- **Concurrency**: SQLite handles locking internally -- no fcntl, no fs wars
+- **Concurrency**: `retry_on_locked` decorator with exponential backoff + jitter on 21 write methods. Safe multi-client access (tested with concurrent opencode sessions)
 - **Reflections**: Parallel FTS5 (`reflection_fts`) and vector (`reflection_embeddings`) indexes for narrative layer, searched via the same RRF hybrid pipeline
 
 ## How It Works
@@ -209,7 +221,7 @@ The output includes `limbic_score`, `scoring` (importance/temporal/cooc breakdow
 uv run pytest tests/ -v
 ```
 
-285+ tests across 15 test files covering all tools, embeddings, scoring, and edge cases. Zero regressions.
+308 tests across 15 test files covering all tools, embeddings, scoring, and edge cases. Zero regressions.
 
 ## Requirements
 
