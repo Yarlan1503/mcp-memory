@@ -11,6 +11,7 @@ dependencies = [
     "tokenizers>=0.19",
     "onnxruntime>=1.17",
     "huggingface-hub>=0.20",
+    "scipy>=1.11",
 ]
 
 [project.scripts]

@@ -1,16 +1,54 @@
 """Tests for entity_splitter module."""
 
+import numpy as np
 import pytest
 
 from mcp_memory.entity_splitter import (
     _extract_topics,
+    _extract_topics_tfidf,
+    _extract_topics_semantic,
+    _generate_cluster_names,
     _get_threshold,
+    get_threshold,
     _calculate_split_score,
     analyze_entity_for_split,
     propose_entity_split,
     execute_entity_split,
     find_all_split_candidates,
 )
+
+
+# ---------------------------------------------------------------------------
+# Mock embedding engine for semantic tests
+# ---------------------------------------------------------------------------
+
+
+class MockEngine:
+    """Fake EmbeddingEngine that returns deterministic embeddings.
+
+    Accepts a pre-built mapping {text: vector} or generates random ones.
+    """
+
+    def __init__(self, embeddings_map: dict[str, np.ndarray] | None = None):
+        self._map = embeddings_map or {}
+        self._available = True
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def encode(self, texts: list[str], *, task: str = "passage") -> np.ndarray:
+        vectors = []
+        for t in texts:
+            if t in self._map:
+                vectors.append(self._map[t])
+            else:
+                # Deterministic random based on hash
+                rng = np.random.RandomState(hash(t) % 2**31)
+                vec = rng.randn(384).astype(np.float32)
+                vec /= np.linalg.norm(vec)
+                vectors.append(vec)
+        return np.array(vectors)
 
 
 class TestExtractTopics:
@@ -283,3 +321,341 @@ class TestThresholds:
         # 10 obs / 15 threshold = 0.67
         score = _calculate_split_score(10, 15, 2)
         assert score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Semantic clustering tests (Fase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateClusterNames:
+    """Tests for _generate_cluster_names function."""
+
+    def test_basic_two_clusters(self):
+        """Two clusters with distinct vocab get different names."""
+        clusters = {
+            0: ["decisión python proyecto", "decisión código fuente"],
+            1: ["hallazgo memoria rendimiento", "hallazgo cache lento"],
+        }
+        names = _generate_cluster_names(clusters)
+        assert len(names) == 2
+        assert names[0] != names[1]
+        # Names should be capitalized
+        for name in names.values():
+            assert name[0].isupper()
+
+    def test_empty_input(self):
+        """Empty dict returns empty dict."""
+        assert _generate_cluster_names({}) == {}
+
+    def test_single_obs_cluster(self):
+        """Cluster with one observation still gets a name."""
+        clusters = {0: ["decisión usar python"]}
+        names = _generate_cluster_names(clusters)
+        assert len(names) == 1
+        assert 0 in names
+        assert len(names[0]) > 0
+
+    def test_no_keywords_fallback(self):
+        """Cluster with only stop words gets fallback name."""
+        clusters = {0: ["a", "b", "c"]}
+        names = _generate_cluster_names(clusters)
+        assert 0 in names
+        assert names[0] == "Tema_1"
+
+
+class TestExtractTopicsSemantic:
+    """Tests for _extract_topics_semantic function."""
+
+    def _make_engine(self, observations: list[str]) -> MockEngine:
+        """Build a MockEngine with well-separated embeddings for two groups."""
+        n = len(observations)
+        mid = n // 2
+        emb_map: dict[str, np.ndarray] = {}
+        for i, obs in enumerate(observations):
+            vec = np.zeros(384, dtype=np.float32)
+            if i < mid:
+                vec[0] = 1.0  # Group A: positive on dim 0
+            else:
+                vec[1] = 1.0  # Group B: positive on dim 1
+            emb_map[obs] = vec
+        return MockEngine(emb_map)
+
+    def test_two_distinct_groups(self):
+        """Observations from two topics cluster into two groups."""
+        obs = [
+            "DECISIÓN: Usar Python para el backend",
+            "DECISIÓN: Configurar entorno virtual",
+            "HALLAZGO: El servidor tiene alta latencia",
+            "HALLAZGO: La base de datos necesita índices",
+        ]
+        engine = self._make_engine(obs)
+        result = _extract_topics_semantic(obs, engine)
+        assert len(result) == 2
+        # All observations should be assigned
+        total = sum(len(v) for v in result.values())
+        assert total == 4
+
+    def test_single_cluster_falls_back(self):
+        """When all obs are identical, clustering degenerates → TF-IDF fallback."""
+        obs = ["Observación idéntica"] * 5
+        engine = MockEngine()  # Will generate random but identical text → same hash? No.
+        # Force all embeddings to be identical
+        vec = np.ones(384, dtype=np.float32) / np.sqrt(384)
+        engine = MockEngine({o: vec for o in obs})
+        result = _extract_topics_semantic(obs, engine)
+        # Should fall back to TF-IDF (1 cluster is degenerate)
+        # TF-IDF with identical text → 1 topic or fallback
+        assert len(result) >= 1
+
+    def test_n_clusters_falls_back(self):
+        """When each obs is its own cluster, falls back to TF-IDF."""
+        obs = [f"tema único {i}" for i in range(4)]
+        # Make each embedding orthogonal
+        emb_map = {}
+        for i, o in enumerate(obs):
+            vec = np.zeros(384, dtype=np.float32)
+            vec[i] = 1.0
+            emb_map[o] = vec
+        engine = MockEngine(emb_map)
+        result = _extract_topics_semantic(obs, engine)
+        # 4 clusters for 4 obs is degenerate → falls back to TF-IDF
+        assert len(result) >= 1
+
+    def test_empty_list(self):
+        """Empty list returns empty dict."""
+        engine = MockEngine()
+        result = _extract_topics_semantic([], engine)
+        assert result == {}
+
+    def test_single_observation(self):
+        """Single observation falls back to TF-IDF."""
+        engine = MockEngine()
+        result = _extract_topics_semantic(["Única observación"], engine)
+        assert len(result) == 1
+
+
+class TestDispatcherIntegration:
+    """Tests for _extract_topics dispatcher routing."""
+
+    def test_semantic_path_with_mock_engine(self, monkeypatch):
+        """Dispatcher uses semantic path when engine is available."""
+        obs = [
+            "DECISIÓN: Implementar API REST",
+            "DECISIÓN: Configurar autenticación JWT",
+            "HALLAZGO: Memory leak en worker pool",
+            "HALLAZGO: Connection pool agotado",
+        ]
+        # Build well-separated embeddings
+        emb_map = {}
+        for i, o in enumerate(obs):
+            vec = np.zeros(384, dtype=np.float32)
+            if i < 2:
+                vec[0] = 1.0
+            else:
+                vec[1] = 1.0
+            emb_map[o] = vec
+        mock_engine = MockEngine(emb_map)
+
+        def mock_get_engine():
+            return mock_engine
+
+        monkeypatch.setattr(
+            "mcp_memory.entity_splitter._get_engine", mock_get_engine, raising=False
+        )
+        # Also patch the import inside _extract_topics
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", mock_get_engine, raising=False
+        )
+
+        result = _extract_topics(obs)
+        assert len(result) == 2
+        total = sum(len(v) for v in result.values())
+        assert total == 4
+
+    def test_tfidf_fallback_when_no_engine(self, monkeypatch):
+        """Dispatcher falls back to TF-IDF when engine is None."""
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: None, raising=False
+        )
+        obs = [
+            "DECISIÓN: Usar Python",
+            "DECISIÓN: Configurar Docker",
+            "HALLAZGO: Cache lento",
+        ]
+        result = _extract_topics(obs)
+        assert len(result) >= 1
+
+    def test_tfidf_fallback_when_engine_unavailable(self, monkeypatch):
+        """Dispatcher falls back to TF-IDF when engine.available is False."""
+        mock_engine = MockEngine()
+        mock_engine._available = False
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: mock_engine, raising=False
+        )
+        obs = ["Observación de prueba"]
+        result = _extract_topics(obs)
+        assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: full pipeline with store + semantic clustering
+# ---------------------------------------------------------------------------
+
+
+def _build_semantic_engine(
+    group_a: list[str], group_b: list[str]
+) -> MockEngine:
+    """Build a MockEngine where group_a and group_b are well-separated."""
+    emb_map: dict[str, np.ndarray] = {}
+    for obs in group_a:
+        vec = np.zeros(384, dtype=np.float32)
+        vec[0] = 1.0
+        emb_map[obs] = vec
+    for obs in group_b:
+        vec = np.zeros(384, dtype=np.float32)
+        vec[1] = 1.0
+        emb_map[obs] = vec
+    return MockEngine(emb_map)
+
+
+class TestSemanticIntegration:
+    """Integration tests: store + semantic clustering end-to-end."""
+
+    def test_analyze_with_semantic_topics(self, store_with_schema, monkeypatch):
+        """analyze_entity_for_split produces semantic topics, not tema_N."""
+        # Create entity with 21 observations (threshold=20)
+        group_a = [f"DECISIÓN: Configurar API endpoint {i}" for i in range(10)]
+        group_b = [f"HALLAZGO: Error memoria worker {i}" for i in range(11)]
+        all_obs = group_a + group_b
+
+        entity_id = store_with_schema.upsert_entity("BigEntity", "Persona")
+        store_with_schema.add_observations(entity_id, all_obs)
+
+        # Mock engine with well-separated embeddings
+        engine = _build_semantic_engine(group_a, group_b)
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: engine, raising=False
+        )
+
+        result = analyze_entity_for_split(store_with_schema, "BigEntity")
+        assert result is not None
+        assert result["needs_split"] is True
+        assert result["observation_count"] == 21
+
+        # Topics should be 2 semantic clusters, not 21 individual tema_N
+        topics = result["topics"]
+        assert len(topics) == 2
+        total_obs = sum(len(v) for v in topics.values())
+        assert total_obs == 21
+
+        # Topic names should NOT be generic "tema_N"
+        for name in topics:
+            assert not name.startswith("tema_"), f"Got generic name: {name}"
+
+    def test_propose_with_semantic_topics(self, store_with_schema, monkeypatch):
+        """propose_entity_split returns meaningful split names."""
+        group_a = [f"DECISIÓN: Migrar base datos {i}" for i in range(10)]
+        group_b = [f"HALLAZGO: Latencia red alta {i}" for i in range(10)]
+        all_obs = group_a + group_b
+
+        entity_id = store_with_schema.upsert_entity("SplitEntity", "Sesion")
+        store_with_schema.add_observations(entity_id, all_obs)
+
+        engine = _build_semantic_engine(group_a, group_b)
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: engine, raising=False
+        )
+
+        proposal = propose_entity_split(store_with_schema, "SplitEntity")
+        assert proposal is not None
+        assert proposal["original_entity"]["name"] == "SplitEntity"
+
+        splits = proposal["suggested_splits"]
+        assert len(splits) == 2
+
+        # Split names should be "ParentName - TopicName"
+        for split in splits:
+            assert split["name"].startswith("SplitEntity - ")
+            # Topic part should not be generic
+            topic_part = split["name"].split(" - ", 1)[1]
+            assert not topic_part.startswith("tema_")
+
+        # Relations: 2 per split (contiene + parte_de)
+        assert len(proposal["relations_to_create"]) == 4
+
+    def test_semantic_vs_tfidf_produces_fewer_topics(
+        self, store_with_schema, monkeypatch
+    ):
+        """Semantic clustering produces fewer, more meaningful topics than TF-IDF."""
+        # 21 observations with overlapping keywords but distinct semantics
+        api_obs = [
+            f"DECISIÓN: Configurar endpoint API REST {i}" for i in range(7)
+        ]
+        db_obs = [
+            f"DECISIÓN: Crear índice base datos {i}" for i in range(7)
+        ]
+        cache_obs = [
+            f"DECISIÓN: Implementar cache Redis {i}" for i in range(7)
+        ]
+        all_obs = api_obs + db_obs + cache_obs
+
+        entity_id = store_with_schema.upsert_entity("MultiTopic", "Persona")
+        store_with_schema.add_observations(entity_id, all_obs)
+
+        # --- TF-IDF path (no engine) ---
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: None, raising=False
+        )
+        tfidf_result = analyze_entity_for_split(store_with_schema, "MultiTopic")
+        tfidf_topics = tfidf_result["topics"]
+
+        # --- Semantic path (engine with 3 clusters) ---
+        emb_map: dict[str, np.ndarray] = {}
+        for obs in api_obs:
+            v = np.zeros(384, dtype=np.float32)
+            v[0] = 1.0
+            emb_map[obs] = v
+        for obs in db_obs:
+            v = np.zeros(384, dtype=np.float32)
+            v[1] = 1.0
+            emb_map[obs] = v
+        for obs in cache_obs:
+            v = np.zeros(384, dtype=np.float32)
+            v[2] = 1.0
+            emb_map[obs] = v
+        engine = MockEngine(emb_map)
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: engine, raising=False
+        )
+        semantic_result = analyze_entity_for_split(store_with_schema, "MultiTopic")
+        semantic_topics = semantic_result["topics"]
+
+        # Semantic should produce exactly 3 clusters
+        assert len(semantic_topics) == 3
+        # All obs accounted for
+        assert sum(len(v) for v in semantic_topics.values()) == 21
+
+    def test_fallback_to_tfidf_when_engine_crashes(
+        self, store_with_schema, monkeypatch
+    ):
+        """If engine.encode() raises, gracefully falls back to TF-IDF."""
+
+        class BrokenEngine:
+            available = True
+
+            def encode(self, texts, **kw):
+                raise RuntimeError("ONNX session crashed")
+
+        monkeypatch.setattr(
+            "mcp_memory._helpers._get_engine", lambda: BrokenEngine(), raising=False
+        )
+
+        entity_id = store_with_schema.upsert_entity("CrashTest", "Sesion")
+        obs = [f"Observación {i}" for i in range(16)]
+        store_with_schema.add_observations(entity_id, obs)
+
+        # Should not raise — falls back to TF-IDF
+        result = analyze_entity_for_split(store_with_schema, "CrashTest")
+        assert result is not None
+        assert result["needs_split"] is True

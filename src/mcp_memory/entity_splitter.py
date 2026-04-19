@@ -355,6 +355,14 @@ _MIN_WORD_LEN = 4
 # Minimum document frequency for TF-IDF (as count)
 _MIN_DOC_FREQ = 2
 
+# ---------------------------------------------------------------------------
+# Semantic clustering constants
+# ---------------------------------------------------------------------------
+_CLUSTER_DISTANCE_THRESHOLD = 0.5  # Cosine distance cutoff for cluster merging
+_CLUSTER_LINKAGE = "average"  # Linkage method for agglomerative clustering
+_CLUSTER_METRIC = "cosine"  # Distance metric
+_CLUSTER_TOP_KEYWORDS = 2  # Number of keywords per cluster name
+
 
 # ---------------------------------------------------------------------------
 # Topic extraction
@@ -398,11 +406,11 @@ def _compute_idf(observations: list[str]) -> dict[str, float]:
     }
 
 
-def _extract_topics(observations: list[str]) -> dict[str, list[str]]:
-    """Extract topics from observations using TF-IDF and grouping.
+def _extract_topics_tfidf(observations: list[str]) -> dict[str, list[str]]:
+    """Extract topics from observations using TF-IDF keyword grouping.
 
-    Returns a dict mapping topic_name -> [list_of_observations].
-    Each topic represents a cluster of observations sharing common keywords.
+    Fallback strategy when EmbeddingEngine is unavailable.
+    Groups observations by top TF-IDF keyword overlap.
     """
     if not observations:
         return {}
@@ -479,13 +487,193 @@ def _extract_topics(observations: list[str]) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Semantic clustering (Fase 2)
+# ---------------------------------------------------------------------------
+
+
+def _generate_cluster_names(
+    cluster_observations: dict[int, list[str]],
+) -> dict[int, str]:
+    """Generate descriptive names for clusters using c-TF-IDF.
+
+    Each cluster is treated as a "document" in a corpus.
+    The top TF-IDF keywords (relative to other clusters) become the name.
+
+    Args:
+        cluster_observations: {cluster_id: [observation_texts]}
+
+    Returns:
+        {cluster_id: "Keyword1 Keyword2"} — capitalized, joined by space.
+    """
+    if not cluster_observations:
+        return {}
+
+    # Build per-cluster token sets and global doc frequency
+    cluster_tokens: dict[int, list[str]] = {}
+    doc_freq: Counter = Counter()
+
+    for cid, obs_list in cluster_observations.items():
+        tokens: list[str] = []
+        seen_in_cluster: set[str] = set()
+        for obs in obs_list:
+            for t in _tokenize(obs):
+                tokens.append(t)
+                if t not in seen_in_cluster:
+                    seen_in_cluster.add(t)
+                    doc_freq[t] += 1
+        cluster_tokens[cid] = tokens
+
+    n_clusters = len(cluster_observations)
+    if n_clusters == 0:
+        return {}
+
+    # Compute c-TF-IDF per cluster
+    names: dict[int, str] = {}
+    for cid, tokens in cluster_tokens.items():
+        if not tokens:
+            names[cid] = f"Tema_{cid + 1}"
+            continue
+
+        tf = Counter(tokens)
+        total = sum(tf.values())
+        scores: dict[str, float] = {}
+        for term, count in tf.items():
+            df = doc_freq.get(term, 1)
+            scores[term] = (count / total) * math.log(n_clusters / df)
+
+        # Take top keywords
+        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        top_terms = [t for t, _ in top[:_CLUSTER_TOP_KEYWORDS]]
+        names[cid] = " ".join(t.capitalize() for t in top_terms)
+
+    return names
+
+
+def _extract_topics_semantic(
+    observations: list[str], engine: Any
+) -> dict[str, list[str]]:
+    """Extract topics via agglomerative clustering on embeddings.
+
+    Pipeline:
+        1. Encode observations → (n, 384) float32
+        2. Pairwise cosine distance matrix
+        3. Agglomerative clustering (average linkage, distance threshold)
+        4. Name clusters with c-TF-IDF
+
+    Falls back to TF-IDF if clustering is degenerate (1 cluster or n clusters).
+
+    Args:
+        observations: List of observation texts.
+        engine: EmbeddingEngine instance (must be available).
+
+    Returns:
+        Dict mapping cluster_name → [observation_texts].
+    """
+    import numpy as np
+    from scipy.cluster.hierarchy import fcluster, linkage
+
+    n = len(observations)
+    if n < 2:
+        return _extract_topics_tfidf(observations)
+
+    # 1. Encode
+    embeddings = engine.encode(observations)  # (n, 384), L2-normalised
+
+    # 2. Pairwise cosine distance (1 - cosine_similarity)
+    #    For L2-normalised vectors: cosine_sim = dot product
+    sim_matrix = embeddings @ embeddings.T  # (n, n)
+    dist_matrix = 1.0 - sim_matrix
+    # Clamp to [0, 2] to avoid floating-point negatives
+    dist_matrix = np.clip(dist_matrix, 0.0, 2.0)
+
+    # 3. Convert condensed distance matrix for linkage
+    #    scipy expects upper-triangle as condensed vector
+    from scipy.spatial.distance import squareform
+
+    condensed = squareform(dist_matrix, checks=False)
+
+    # 4. Agglomerative clustering
+    Z = linkage(condensed, method=_CLUSTER_LINKAGE, metric=_CLUSTER_METRIC)
+    labels = fcluster(Z, t=_CLUSTER_DISTANCE_THRESHOLD, criterion="distance")
+
+    # 5. Group observations by cluster label
+    cluster_obs: dict[int, list[str]] = {}
+    for i, label in enumerate(labels):
+        cid = int(label)
+        if cid not in cluster_obs:
+            cluster_obs[cid] = []
+        cluster_obs[cid].append(observations[i])
+
+    num_clusters = len(cluster_obs)
+
+    # 6. Degenerate check: 1 cluster or n clusters → fall back to TF-IDF
+    if num_clusters <= 1 or num_clusters >= n:
+        logger.debug(
+            "Semantic clustering degenerate (%d clusters for %d obs) — "
+            "falling back to TF-IDF",
+            num_clusters,
+            n,
+        )
+        return _extract_topics_tfidf(observations)
+
+    # 7. Name clusters
+    names = _generate_cluster_names(cluster_obs)
+
+    # 8. Build result
+    result: dict[str, list[str]] = {}
+    for cid, obs_list in cluster_obs.items():
+        name = names.get(cid, f"Tema_{cid + 1}")
+        # Deduplicate name if collision
+        if name in result:
+            name = f"{name}_{cid + 1}"
+        result[name] = obs_list
+
+    logger.debug(
+        "Semantic clustering produced %d clusters for %d observations",
+        len(result),
+        n,
+    )
+
+    return result
+
+
+def _extract_topics(observations: list[str]) -> dict[str, list[str]]:
+    """Extract topics from observations.
+
+    Dispatcher: tries semantic clustering (embeddings + agglomerative),
+    falls back to TF-IDF keyword grouping if EmbeddingEngine unavailable.
+
+    Returns a dict mapping topic_name -> [list_of_observations].
+    """
+    if not observations:
+        return {}
+
+    # Try semantic path
+    try:
+        from mcp_memory._helpers import _get_engine
+
+        engine = _get_engine()
+        if engine is not None and engine.available and len(observations) >= 2:
+            return _extract_topics_semantic(observations, engine)
+    except Exception:
+        logger.debug("Semantic path unavailable, falling back to TF-IDF", exc_info=True)
+
+    # TF-IDF fallback
+    return _extract_topics_tfidf(observations)
+
+
+# ---------------------------------------------------------------------------
 # Split candidate detection
 # ---------------------------------------------------------------------------
 
 
-def _get_threshold(entity_type: str) -> int:
+def get_threshold(entity_type: str) -> int:
     """Return observation threshold for entity type."""
     return _THRESHOLDS.get(entity_type, _DEFAULT_THRESHOLD)
+
+
+# Backward-compatible alias (used by entity_mgmt.py)
+_get_threshold = get_threshold
 
 
 def _calculate_split_score(obs_count: int, threshold: int, num_topics: int) -> float:
@@ -523,7 +711,7 @@ def analyze_entity_for_split(
     obs_count = len(observations)
     entity_type = entity["entity_type"]
 
-    threshold = _get_threshold(entity_type)
+    threshold = get_threshold(entity_type)
 
     # Extract topics
     topics = _extract_topics(observations)
