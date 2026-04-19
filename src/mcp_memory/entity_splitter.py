@@ -713,13 +713,26 @@ def analyze_entity_for_split(
 
     threshold = get_threshold(entity_type)
 
-    # Extract topics
+    # Early exit: skip topic extraction if under threshold.
+    # This avoids expensive ONNX encoding for entities that can't need splitting.
+    if obs_count <= threshold:
+        return {
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "observation_count": obs_count,
+            "threshold": threshold,
+            "needs_split": False,
+            "topics": {},
+            "split_score": obs_count / threshold if threshold > 0 else 1.0,
+        }
+
+    # Extract topics (only for entities exceeding threshold)
     topics = _extract_topics(observations)
     num_topics = len(topics)
 
     # Calculate split score
     split_score = _calculate_split_score(obs_count, threshold, num_topics)
-    needs_split = split_score > 1.0 and obs_count > threshold
+    needs_split = split_score > 1.0
 
     logger.debug(
         "Analyzed entity '%s' (type=%s): obs=%d, threshold=%d, "
