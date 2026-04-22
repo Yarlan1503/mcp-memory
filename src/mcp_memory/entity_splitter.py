@@ -375,17 +375,21 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in tokens if len(t) >= _MIN_WORD_LEN and t not in _STOP_WORDS]
 
 
-def _compute_tf(observations: list[str]) -> dict[str, float]:
-    """Compute term frequency per document (observation)."""
-    tf: dict[str, float] = Counter()
-    for obs in observations:
+def _compute_tf(observations: list[str]) -> dict[int, dict[str, float]]:
+    """Compute term frequency per document (observation).
+
+    Returns:
+        dict mapping document index -> {term: relative frequency in that doc}.
+    """
+    result: dict[int, dict[str, float]] = {}
+    for i, obs in enumerate(observations):
         tokens = _tokenize(obs)
-        for token in tokens:
-            tf[token] += 1
-    total = sum(tf.values())
-    if total == 0:
-        return {}
-    return {term: count / total for term, count in tf.items()}
+        if not tokens:
+            continue
+        counts = Counter(tokens)
+        total = sum(counts.values())
+        result[i] = {term: count / total for term, count in counts.items()}
+    return result
 
 
 def _compute_idf(observations: list[str]) -> dict[str, float]:
@@ -417,19 +421,21 @@ def _extract_topics_tfidf(observations: list[str]) -> dict[str, list[str]]:
 
     n_obs = len(observations)
 
-    # Compute TF and IDF
-    tf = _compute_tf(observations)
+    # Compute TF (per-document) and IDF
+    tf_per_doc = _compute_tf(observations)
     idf = _compute_idf(observations)
 
-    if not tf or not idf:
+    if not tf_per_doc or not idf:
         # Fallback: treat each observation as its own topic if no keywords found
         return {f"tema_{i + 1}": [obs] for i, obs in enumerate(observations)}
 
-    # Compute TF-IDF scores for each term
+    # Compute global TF-IDF scores for each term
+    # Aggregate per-document TF-IDF (sum across docs where term appears)
     tfidf_scores: dict[str, float] = {}
-    for term, tf_val in tf.items():
-        if term in idf:
-            tfidf_scores[term] = tf_val * idf[term]
+    for doc_idx, tf_doc in tf_per_doc.items():
+        for term, tf_val in tf_doc.items():
+            if term in idf:
+                tfidf_scores[term] = tfidf_scores.get(term, 0.0) + tf_val * idf[term]
 
     if not tfidf_scores:
         return {f"tema_{i + 1}": [obs] for i, obs in enumerate(observations)}

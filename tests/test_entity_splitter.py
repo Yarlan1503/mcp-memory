@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from mcp_memory.entity_splitter import (
+    _compute_tf,
     _extract_topics,
     _extract_topics_tfidf,
     _extract_topics_semantic,
@@ -433,6 +434,45 @@ class TestExtractTopicsSemantic:
         engine = MockEngine()
         result = _extract_topics_semantic(["Única observación"], engine)
         assert len(result) == 1
+
+
+class TestComputeTf:
+    """Tests for _compute_tf per-document term frequency."""
+
+    def test_compute_tf_two_docs_distinct_terms(self):
+        """Two docs with distinct terms each get their own TF dict."""
+        result = _compute_tf(["alpha beta", "gamma delta"])
+        assert result == {
+            0: {"alpha": 0.5, "beta": 0.5},
+            1: {"gamma": 0.5, "delta": 0.5},
+        }
+
+    def test_compute_tf_repeated_terms_proportional(self):
+        """Repeated terms in the same doc have proportional TF."""
+        result = _compute_tf(["alpha alpha beta"])
+        assert len(result) == 1
+        assert result[0]["alpha"] == pytest.approx(2 / 3)
+        assert result[0]["beta"] == pytest.approx(1 / 3)
+
+    def test_extract_topics_tfidf_with_new_per_doc_structure(self):
+        """_extract_topics_tfidf works correctly with per-document TF."""
+        observations = [
+            "decisión usar python proyecto",
+            "decisión usar docker proyecto",
+            "hallazgo rendimiento lento servidor",
+            "hallazgo rendimiento lento base datos",
+        ]
+        topics = _extract_topics_tfidf(observations)
+        # Should return non-empty dict mapping topic names to observation lists
+        assert isinstance(topics, dict)
+        assert len(topics) >= 1
+        for topic_name, obs_list in topics.items():
+            assert isinstance(topic_name, str)
+            assert isinstance(obs_list, list)
+            assert len(obs_list) > 0
+        # All observations should be assigned
+        total_assigned = sum(len(v) for v in topics.values())
+        assert total_assigned == len(observations)
 
 
 class TestDispatcherIntegration:

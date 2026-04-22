@@ -23,10 +23,6 @@ _ROOT_FILES = [
 ]
 _ONNX_FILE = "onnx/model.onnx"
 
-# E5-small requires task prefixes for asymmetric retrieval
-QUERY_PREFIX = "query: "
-PASSAGE_PREFIX = "passage: "
-
 # Token budget constants for prepare_entity_text
 OVERHEAD_TOKENS = 25  # Tokens para "name (type): " + "Rel: ..." overhead
 MAX_TOKENS = 480  # Budget total (512 - buffer)
@@ -215,10 +211,10 @@ class EmbeddingEngine:
     def encode(self, texts: list[str], *, task: str = "passage") -> np.ndarray:
         """Encode *texts* into an L2-normalised ``(n, 384)`` float32 array.
 
-        Pipeline: prefix → tokenise → ONNX forward → mean-pool → L2-normalise.
+        Pipeline: tokenise → ONNX forward → mean-pool → L2-normalise.
 
-        The ``task`` parameter controls the E5-small prefix:
-        ``"query"`` for search queries, ``"passage"`` (default) for stored text.
+        The ``task`` parameter is kept for API compatibility but is not used
+        by the current MiniLM-based model.
 
         Raises ``RuntimeError`` if the model is not loaded.
         """
@@ -227,12 +223,8 @@ class EmbeddingEngine:
         if not self._available:
             raise RuntimeError("Embedding model not available")
 
-        # 0. Apply e5-small task prefix ----------------------------------
-        prefix = QUERY_PREFIX if task == "query" else PASSAGE_PREFIX
-        prefixed = [prefix + t for t in texts]
-
         # 1. Tokenise ---------------------------------------------------
-        encoded = self._tokenizer.encode_batch(prefixed)
+        encoded = self._tokenizer.encode_batch(texts)
 
         input_ids = np.array(
             [e.ids for e in encoded],
