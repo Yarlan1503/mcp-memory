@@ -99,6 +99,19 @@ class AccessMixin:
         ).fetchall()
         return {r["entity_id"]: r["access_days"] for r in rows}
 
+    def days_since_access(self, last_access: str | None) -> int | None:
+        """Compute days since last access using SQLite julianday (avoids timezone issues)."""
+        if last_access is None:
+            return None
+        try:
+            row = self.db.execute(
+                "SELECT CAST(julianday('now') - julianday(?) AS INTEGER)",
+                (last_access,),
+            ).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
     def get_entity_degrees(self, entity_ids: list[int]) -> dict[int, int]:
         """Get relation degree count for a list of entity IDs.
         Counts relations where entity is either from_entity or to_entity."""

@@ -219,6 +219,33 @@ class CoreMixin:
 
         inserted = 0
 
+        def _dedup_observations(obs_list: list[str]) -> list[str]:
+            """Remove observations already in DB for this entity and internal duplicates."""
+            placeholders = ",".join("?" for _ in obs_list)
+            rows = self.db.execute(
+                f"SELECT content FROM observations WHERE entity_id = ? AND content IN ({placeholders})",
+                (entity_id, *obs_list),
+            ).fetchall()
+            existing_set = {r["content"] for r in rows}
+            seen: set[str] = set()
+            new_obs: list[str] = []
+            for content in obs_list:
+                if content not in existing_set and content not in seen:
+                    seen.add(content)
+                    new_obs.append(content)
+            return new_obs
+
+        def _insert_many(obs_list: list[str]) -> int:
+            """Batch insert observations with flag=0."""
+            if not obs_list:
+                return 0
+            self.db.executemany(
+                "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                "VALUES (?, ?, 0, ?)",
+                [(entity_id, content, kind) for content in obs_list],
+            )
+            return len(obs_list)
+
         # Try to get embedding engine for semantic dedup
         engine = self._get_embedding_engine()
         existing_obs = self.get_observations(entity_id)
@@ -231,77 +258,50 @@ class CoreMixin:
                 # Batch encode all existing observations
                 existing_embeddings = engine.encode(existing_obs)
 
-                for content in observations:
-                    # Skip exact duplicates
-                    exact = self.db.execute(
-                        "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
-                        (entity_id, content),
-                    ).fetchone()
-                    if exact:
-                        continue
+                # Batch exact dedup before encoding new observations
+                candidates = _dedup_observations(observations)
 
-                    # Encode the new observation
-                    new_embedding = engine.encode([content])  # (1, 384)
+                if candidates:
+                    candidate_embeddings = engine.encode(candidates)
 
-                    # Cosine similarity with all existing (L2-normalised → dot product)
-                    similarities = existing_embeddings @ new_embedding[0]  # (n,)
-                    max_sim = (
-                        float(np.max(similarities)) if len(similarities) > 0 else 0.0
-                    )
+                    for content, new_embedding in zip(candidates, candidate_embeddings):
+                        # Cosine similarity with all existing (L2-normalised → dot product)
+                        similarities = existing_embeddings @ new_embedding  # (n,)
+                        max_sim = (
+                            float(np.max(similarities)) if len(similarities) > 0 else 0.0
+                        )
 
-                    # Find the index of the most similar existing observation
-                    max_idx = (
-                        int(np.argmax(similarities)) if len(similarities) > 0 else 0
-                    )
-                    best_existing = existing_obs[max_idx] if existing_obs else ""
+                        # Find the index of the most similar existing observation
+                        max_idx = (
+                            int(np.argmax(similarities)) if len(similarities) > 0 else 0
+                        )
+                        best_existing = existing_obs[max_idx] if existing_obs else ""
 
-                    # Combined similarity: cosine OR containment for asymmetric pairs
-                    from mcp_memory.scoring import combined_similarity
+                        # Combined similarity: cosine OR containment for asymmetric pairs
+                        from mcp_memory.scoring import combined_similarity
 
-                    flag = (
-                        1 if combined_similarity(max_sim, content, best_existing) else 0
-                    )
+                        flag = (
+                            1 if combined_similarity(max_sim, content, best_existing) else 0
+                        )
 
-                    self.db.execute(
-                        "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
-                        "VALUES (?, ?, ?, ?)",
-                        (entity_id, content, flag, kind),
-                    )
-                    inserted += 1
+                        self.db.execute(
+                            "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                            "VALUES (?, ?, ?, ?)",
+                            (entity_id, content, flag, kind),
+                        )
+                        inserted += 1
 
             except Exception as exc:
                 logger.warning(
                     "Semantic dedup failed, falling back to normal insert: %s", exc
                 )
-                # Fallback: insert remaining without flag
-                for content in observations:
-                    exact = self.db.execute(
-                        "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
-                        (entity_id, content),
-                    ).fetchone()
-                    if exact:
-                        continue
-                    self.db.execute(
-                        "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
-                        "VALUES (?, ?, 0, ?)",
-                        (entity_id, content, kind),
-                    )
-                    inserted += 1
+                # Fallback: dedup exact + batch insert remaining without flag
+                new_obs = _dedup_observations(observations)
+                inserted += _insert_many(new_obs)
         else:
             # --- Normal path: no engine or no existing observations ---
-            for content in observations:
-                exact = self.db.execute(
-                    "SELECT 1 FROM observations WHERE entity_id = ? AND content = ?",
-                    (entity_id, content),
-                ).fetchone()
-                if exact:
-                    continue
-                self.db.execute(
-                    "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
-                    "VALUES (?, ?, 0, ?)",
-                    (entity_id, content, kind),
-                )
-                inserted += 1
+            new_obs = _dedup_observations(observations)
+            inserted += _insert_many(new_obs)
 
         # --- Apply supersedes after insertion ---
         if supersedes is not None and inserted > 0:

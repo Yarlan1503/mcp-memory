@@ -15,8 +15,10 @@ import mcp_memory.tools.entity_mgmt as entity_mgmt_module
 
 def _patch_store(store):
     """Temporarily patch the global store reference in entity_mgmt."""
-    original = entity_mgmt_module._server_mod.store
-    entity_mgmt_module._server_mod.store = store
+    import mcp_memory.server as _server_mod
+
+    original = _server_mod.store
+    _server_mod.store = store
     return original
 
 
@@ -31,7 +33,9 @@ class TestAnalyzeEntitySplit:
         try:
             result = entity_mgmt_module.analyze_entity_split("SmallEntity")
         finally:
-            entity_mgmt_module._server_mod.store = original
+            import mcp_memory.server as _server_mod
+
+            _server_mod.store = original
 
         assert "error" not in result
         assert "analysis" in result
@@ -44,7 +48,9 @@ class TestAnalyzeEntitySplit:
         try:
             result = entity_mgmt_module.analyze_entity_split("NonExistent")
         finally:
-            entity_mgmt_module._server_mod.store = original
+            import mcp_memory.server as _server_mod
+
+            _server_mod.store = original
 
         assert "error" in result
         assert "Entity not found" in result["error"]
@@ -61,7 +67,9 @@ class TestProposeEntitySplitTool:
         try:
             result = entity_mgmt_module.propose_entity_split_tool("SmallEntity")
         finally:
-            entity_mgmt_module._server_mod.store = original
+            import mcp_memory.server as _server_mod
+
+            _server_mod.store = original
 
         assert "error" not in result
         assert result["proposal"] is None
@@ -77,7 +85,9 @@ class TestFindSplitCandidates:
         try:
             result = entity_mgmt_module.find_split_candidates()
         finally:
-            entity_mgmt_module._server_mod.store = original
+            import mcp_memory.server as _server_mod
+
+            _server_mod.store = original
 
         assert "error" not in result
         assert result["candidates"] == []
@@ -92,7 +102,9 @@ class TestConsolidationReport:
         try:
             result = entity_mgmt_module.consolidation_report(stale_days=90.0)
         finally:
-            entity_mgmt_module._server_mod.store = original
+            import mcp_memory.server as _server_mod
+
+            _server_mod.store = original
 
         assert "error" not in result
         assert "summary" in result

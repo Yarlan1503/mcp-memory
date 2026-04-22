@@ -1,17 +1,15 @@
 """Reflection tools for MCP Memory knowledge graph."""
 
 import logging
-import math
-from datetime import datetime, timezone
 from typing import Any
 
-import mcp_memory.server as _server_mod
 from mcp_memory.config import MAX_ENTITIES_PER_CALL, MAX_QUERY_LENGTH
-from mcp_memory._helpers import _get_engine
+from mcp_memory._helpers import _get_engine, tool_error_handler
 
 logger = logging.getLogger(__name__)
 
 
+@tool_error_handler
 def add_reflection(
     target_type: str,
     target_id: int | None = None,
@@ -28,28 +26,27 @@ def add_reflection(
         content: The reflection text (free prose, no prefixes).
         mood: Optional mood — 'frustracion', 'satisfaccion', 'curiosidad', 'duda', 'insight'.
     """
-    try:
-        store = _server_mod.store
-        if not content.strip():
-            return {"error": "content cannot be empty"}
+    import mcp_memory.server as _server_mod
 
-        result = store.add_reflection(
-            target_type=target_type,
-            target_id=target_id,
-            author=author,
-            content=content,
-            mood=mood,
-        )
-        if result is None:
-            return {
-                "error": "Invalid parameters — check target_type, author, and mood values"
-            }
-        return {"reflection": result}
-    except Exception as e:
-        logger.error("Error in add_reflection: %s", e)
-        return {"error": str(e)}
+    store = _server_mod.store
+    if not content.strip():
+        return {"error": "content cannot be empty"}
+
+    result = store.add_reflection(
+        target_type=target_type,
+        target_id=target_id,
+        author=author,
+        content=content,
+        mood=mood,
+    )
+    if result is None:
+        return {
+            "error": "Invalid parameters — check target_type, author, and mood values"
+        }
+    return {"reflection": result}
 
 
+@tool_error_handler
 def search_reflections(
     query: str,
     author: str | None = None,
@@ -68,154 +65,99 @@ def search_reflections(
         target_type: Filter by target type.
         limit: Max results (default 10).
     """
-    try:
-        store = _server_mod.store
-        if len(query) > MAX_QUERY_LENGTH:
-            return {
-                "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
-            }
-        if limit > MAX_ENTITIES_PER_CALL:
-            return {
-                "error": f"Limit too high: {limit} > {MAX_ENTITIES_PER_CALL}. Request fewer results."
-            }
+    import mcp_memory.server as _server_mod
 
-        engine = _get_engine()
-        if not engine or not engine.available:
-            return {
-                "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
-            }
+    store = _server_mod.store
+    if len(query) > MAX_QUERY_LENGTH:
+        return {
+            "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
+        }
+    if limit > MAX_ENTITIES_PER_CALL:
+        return {
+            "error": f"Limit too high: {limit} > {MAX_ENTITIES_PER_CALL}. Request fewer results."
+        }
 
-        from mcp_memory.embeddings import serialize_f32
-        from mcp_memory.scoring import reciprocal_rank_fusion
+    engine = _get_engine()
+    if not engine or not engine.available:
+        return {
+            "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
+        }
 
-        # Step 1: Semantic KNN search on reflection_embeddings
-        query_vector = engine.encode([query], task="query")
-        query_bytes = serialize_f32(query_vector[0])
-        expanded_limit = limit * 3  # Over-retrieve for filtering
-        knn_results = store.search_reflection_embeddings(
-            query_bytes, limit=expanded_limit
-        )
+    from mcp_memory.embeddings import serialize_f32
+    from mcp_memory.scoring import reciprocal_rank_fusion, _compute_recency_factor
 
-        # Step 2: FTS5 search on reflection_fts
-        fts_results = store.search_reflection_fts(query, limit=expanded_limit)
+    # Step 1: Semantic KNN search on reflection_embeddings
+    query_vector = engine.encode([query], task="query")
+    query_bytes = serialize_f32(query_vector[0])
+    expanded_limit = limit * 3  # Over-retrieve for filtering
+    knn_results = store.search_reflection_embeddings(
+        query_bytes, limit=expanded_limit
+    )
 
-        # Step 3: RRF merge (adapt format for RRF function)
-        # reciprocal_rank_fusion expects "entity_id" but we have "id" — rename
-        knn_for_rrf = [
-            {"entity_id": r["id"], "distance": r["distance"]} for r in knn_results
-        ]
-        fts_for_rrf = [{"entity_id": r["id"], "rank": r["rank"]} for r in fts_results]
+    # Step 2: FTS5 search on reflection_fts
+    fts_results = store.search_reflection_fts(query, limit=expanded_limit)
 
-        use_hybrid = len(fts_results) > 0
-        if use_hybrid:
-            merged = reciprocal_rank_fusion(knn_for_rrf, fts_for_rrf)
-            candidate_ids = [r["entity_id"] for r in merged]
-        else:
-            merged = None
-            candidate_ids = [r["entity_id"] for r in knn_for_rrf]
+    # Step 3: RRF merge (adapt format for RRF function)
+    # reciprocal_rank_fusion expects "entity_id" but we have "id" — rename
+    knn_for_rrf = [
+        {"entity_id": r["id"], "distance": r["distance"]} for r in knn_results
+    ]
+    fts_for_rrf = [{"entity_id": r["id"], "rank": r["rank"]} for r in fts_results]
 
-        if not candidate_ids:
-            return {"results": []}
+    use_hybrid = len(fts_results) > 0
+    if use_hybrid:
+        merged = reciprocal_rank_fusion(knn_for_rrf, fts_for_rrf)
+        candidate_ids = [r["entity_id"] for r in merged]
+    else:
+        merged = None
+        candidate_ids = [r["entity_id"] for r in knn_for_rrf]
 
-        # Step 4: Fetch reflection data and apply filters
-        placeholders = ",".join("?" for _ in candidate_ids)
+    if not candidate_ids:
+        return {"results": []}
 
-        query_sql = f"""
-            SELECT r.id, r.target_type, r.target_id, r.author, r.content, r.mood, r.created_at
-            FROM reflections r
-            WHERE r.id IN ({placeholders})
-        """
-        params: list[Any] = list(candidate_ids)
+    # Step 4: Fetch reflection data and apply filters
+    rows = store.search_reflections_filtered(
+        candidate_ids, author=author, mood=mood, target_type=target_type
+    )
 
-        # Apply filters as SQL WHERE clauses
-        conditions = []
-        if author:
-            conditions.append("r.author = ?")
-            params.append(author)
-        if mood:
-            conditions.append("r.mood = ?")
-            params.append(mood)
-        if target_type:
-            conditions.append("r.target_type = ?")
-            params.append(target_type)
+    # Build result map for scoring
+    row_map = {r["id"]: dict(r) for r in rows}
 
-        if conditions:
-            query_sql += " AND " + " AND ".join(conditions)
+    # Step 5: Apply recency scoring and sort
+    # Recent reflections rank higher than old ones
+    results = []
+    if merged:
+        for item in merged:
+            rid = item["entity_id"]
+            if rid in row_map:
+                result_item = row_map[rid]
+                base_score = item["rrf_score"]
+                created_at_str = result_item.get("created_at", "")
+                recency = (
+                    _compute_recency_factor(created_at_str)
+                    if created_at_str
+                    else 1.0
+                )
+                result_item["score"] = round(base_score * recency, 6)
+                results.append(result_item)
+    else:
+        # Pure semantic — sort by distance
+        for item in knn_for_rrf:
+            rid = item["entity_id"]
+            if rid in row_map:
+                result_item = row_map[rid]
+                base_score = 1.0 - item["distance"]
+                created_at_str = result_item.get("created_at", "")
+                recency = (
+                    _compute_recency_factor(created_at_str)
+                    if created_at_str
+                    else 1.0
+                )
+                result_item["score"] = round(base_score * recency, 4)
+                results.append(result_item)
 
-        rows = store.db.execute(query_sql, params).fetchall()
+    # Sort by score descending (highest first)
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[:limit]
 
-        # Build result map for scoring
-        row_map = {r["id"]: dict(r) for r in rows}
-
-        # Step 5: Apply recency scoring and sort
-        # Recency factor: max(0.1, exp(-0.0001 * hours_since_creation))
-        # Recent reflections rank higher than old ones
-        REFLECTION_TEMPORAL_FLOOR = 0.1
-        REFLECTION_TEMPORAL_LAMBDA = 0.0001  # Same half-life as entity scoring
-
-        results = []
-        if merged:
-            for item in merged:
-                rid = item["entity_id"]
-                if rid in row_map:
-                    result_item = row_map[rid]
-                    base_score = item["rrf_score"]
-                    # Compute recency factor from created_at
-                    created_at_str = result_item.get("created_at", "")
-                    recency = 1.0
-                    if created_at_str:
-                        try:
-                            dt = datetime.strptime(
-                                created_at_str, "%Y-%m-%d %H:%M:%S"
-                            ).replace(tzinfo=timezone.utc)
-                            hours = max(
-                                0.0,
-                                (datetime.now(timezone.utc) - dt).total_seconds()
-                                / 3600.0,
-                            )
-                            recency = max(
-                                REFLECTION_TEMPORAL_FLOOR,
-                                math.exp(-REFLECTION_TEMPORAL_LAMBDA * hours),
-                            )
-                        except (ValueError, TypeError):
-                            pass
-                    result_item["score"] = round(base_score * recency, 6)
-                    results.append(result_item)
-        else:
-            # Pure semantic — sort by distance
-            for item in knn_for_rrf:
-                rid = item["entity_id"]
-                if rid in row_map:
-                    result_item = row_map[rid]
-                    base_score = 1.0 - item["distance"]
-                    # Compute recency factor from created_at
-                    created_at_str = result_item.get("created_at", "")
-                    recency = 1.0
-                    if created_at_str:
-                        try:
-                            dt = datetime.strptime(
-                                created_at_str, "%Y-%m-%d %H:%M:%S"
-                            ).replace(tzinfo=timezone.utc)
-                            hours = max(
-                                0.0,
-                                (datetime.now(timezone.utc) - dt).total_seconds()
-                                / 3600.0,
-                            )
-                            recency = max(
-                                REFLECTION_TEMPORAL_FLOOR,
-                                math.exp(-REFLECTION_TEMPORAL_LAMBDA * hours),
-                            )
-                        except (ValueError, TypeError):
-                            pass
-                    result_item["score"] = round(base_score * recency, 4)
-                    results.append(result_item)
-
-        # Sort by score descending (highest first)
-        results.sort(key=lambda x: x["score"], reverse=True)
-        results = results[:limit]
-
-        return {"results": results}
-
-    except Exception as e:
-        logger.error("Error in search_reflections: %s", e)
-        return {"error": str(e)}
+    return {"results": results}

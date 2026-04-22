@@ -125,6 +125,34 @@ class ReflectionsMixin:
             for r in rows
         ]
 
+    def get_reflections_for_target_batch(
+        self, target_type: str, target_ids: list[int]
+    ) -> dict[int, list[dict]]:
+        """Get reflections for multiple targets in a single query.
+
+        Returns dict mapping target_id -> list of reflection dicts.
+        """
+        if not target_ids or target_type == "global":
+            return {}
+        placeholders = ",".join("?" for _ in target_ids)
+        rows = self.db.execute(
+            f"SELECT id, target_id, author, content, mood, created_at FROM reflections "
+            f"WHERE target_type = ? AND target_id IN ({placeholders}) ORDER BY created_at",
+            (target_type, *target_ids),
+        ).fetchall()
+        result = {tid: [] for tid in target_ids}
+        for r in rows:
+            result[r["target_id"]].append(
+                {
+                    "id": r["id"],
+                    "author": r["author"],
+                    "content": r["content"],
+                    "mood": r["mood"],
+                    "created_at": r["created_at"],
+                }
+            )
+        return result
+
     def search_reflection_fts(self, query: str, limit: int = 10) -> list[dict]:
         """FTS5 search on reflection_fts. Returns list of {id, rank}."""
         if not self._fts_available or not query.strip():
@@ -170,3 +198,43 @@ class ReflectionsMixin:
         except Exception as exc:
             logger.warning("Reflection embedding search failed: %s", exc)
             return []
+
+    def search_reflections_filtered(
+        self,
+        candidate_ids: list[int],
+        author: str | None = None,
+        mood: str | None = None,
+        target_type: str | None = None,
+    ) -> list[dict]:
+        """Fetch reflection data for candidate IDs and apply optional filters.
+
+        Returns list of dicts with id, target_type, target_id, author, content,
+        mood, and created_at.
+        """
+        if not candidate_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in candidate_ids)
+        query_sql = f"""
+            SELECT r.id, r.target_type, r.target_id, r.author, r.content, r.mood, r.created_at
+            FROM reflections r
+            WHERE r.id IN ({placeholders})
+        """
+        params: list[Any] = list(candidate_ids)
+
+        conditions = []
+        if author:
+            conditions.append("r.author = ?")
+            params.append(author)
+        if mood:
+            conditions.append("r.mood = ?")
+            params.append(mood)
+        if target_type:
+            conditions.append("r.target_type = ?")
+            params.append(target_type)
+
+        if conditions:
+            query_sql += " AND " + " AND ".join(conditions)
+
+        rows = self.db.execute(query_sql, params).fetchall()
+        return [dict(r) for r in rows]

@@ -7,14 +7,13 @@ import random
 import time
 from typing import Any
 
-import mcp_memory.server as _server_mod
 from mcp_memory.config import (
     BASELINE_PROBABILITY,
     MAX_ENTITIES_PER_CALL,
     MAX_QUERY_LENGTH,
     USE_AB_TESTING,
 )
-from mcp_memory._helpers import _entity_to_output, _get_engine
+from mcp_memory._helpers import _entity_to_output, _get_engine, tool_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +82,9 @@ def _execute_hybrid_search(
     from mcp_memory.embeddings import serialize_f32
     from mcp_memory.scoring import EXPANSION_FACTOR, reciprocal_rank_fusion
 
-    store = _server_mod.store
+    import mcp_memory.server as _server_mod
 
+    store = _server_mod.store
     query_vector = engine.encode([query], task="query")
     query_bytes = serialize_f32(query_vector[0])
     expanded_limit = limit * EXPANSION_FACTOR
@@ -219,6 +219,8 @@ def _apply_deboosts(ranked: list[dict], treatment: int) -> list[dict]:
 
     Modifies limbic_score in-place and returns ranked.
     """
+    import mcp_memory.server as _server_mod
+
     store = _server_mod.store
 
     STATUS_MULTIPLIERS = {
@@ -272,6 +274,8 @@ def _build_search_output(
 
     Returns: (output_list, top_k_entity_ids)
     """
+    import mcp_memory.server as _server_mod
+
     store = _server_mod.store
 
     output = []
@@ -347,6 +351,8 @@ def _log_shadow_and_track(
     shadow_start_time: float,
 ) -> None:
     """Log shadow mode results and record limbic access tracking."""
+    import mcp_memory.server as _server_mod
+
     store = _server_mod.store
 
     if event_id is not None:
@@ -415,60 +421,60 @@ def _log_shadow_and_track(
 # ============================================================
 
 
+@tool_error_handler
 def search_nodes(query: str) -> dict[str, Any]:
     """Search for nodes in the knowledge graph by name, type, or observation content."""
     start_time = time.perf_counter()
     event_id = None
+    import mcp_memory.server as _server_mod
+
+    store = _server_mod.store
+
+    if len(query) > MAX_QUERY_LENGTH:
+        return {
+            "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
+        }
+
+    if not query.strip():
+        return {"entities": []}
+
+    # --- SHADOW MODE: Log to database (best-effort, non-blocking) ---
     try:
-        store = _server_mod.store
+        event_id = store.log_search_event(
+            query_text=query,
+            treatment=-1,  # LIKE search, no A/B test
+            k_limit=0,
+            num_results=0,  # Will update after query
+            duration_ms=None,
+            engine_used="like",
+        )
+    except Exception as e:
+        logger.warning("Shadow mode event logging failed: %s", e)
+        event_id = None
 
-        if len(query) > MAX_QUERY_LENGTH:
-            return {
-                "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
-            }
+    entities = store.search_entities(query)
+    results = []
+    for entity in entities:
+        obs = store.get_observations(entity["id"])
+        results.append(_entity_to_output(entity, obs))
 
-        if not query.strip():
-            return {"entities": []}
-
-        # --- SHADOW MODE: Log to database (best-effort, non-blocking) ---
+    # Update event with final count and duration
+    if event_id is not None:
+        duration_ms = (time.perf_counter() - start_time) * 1000
         try:
-            event_id = store.log_search_event(
-                query_text=query,
-                treatment=-1,  # LIKE search, no A/B test
-                k_limit=0,
-                num_results=0,  # Will update after query
-                duration_ms=None,
+            store.update_search_event_completion(
+                event_id=event_id,
+                num_results=len(results),
+                duration_ms=duration_ms,
                 engine_used="like",
             )
-        except Exception as e:
-            logger.warning("Shadow mode event logging failed: %s", e)
-            event_id = None
+        except Exception:
+            pass  # Non-critical
 
-        entities = store.search_entities(query)
-        results = []
-        for entity in entities:
-            obs = store.get_observations(entity["id"])
-            results.append(_entity_to_output(entity, obs))
-
-        # Update event with final count and duration
-        if event_id is not None:
-            duration_ms = (time.perf_counter() - start_time) * 1000
-            try:
-                store.update_search_event_completion(
-                    event_id=event_id,
-                    num_results=len(results),
-                    duration_ms=duration_ms,
-                    engine_used="like",
-                )
-            except Exception:
-                pass  # Non-critical
-
-        return {"entities": results}
-    except Exception as e:
-        logger.error("Error in search_nodes: %s", e)
-        return {"error": str(e)}
+    return {"entities": results}
 
 
+@tool_error_handler
 def open_nodes(
     names: list[str], kinds: list[str] | None = None, include_superseded: bool = False
 ) -> dict[str, Any]:
@@ -479,167 +485,168 @@ def open_nodes(
         kinds: Optional filter — only include observations matching these kinds.
             If None or empty, include all kinds.
         include_superseded: If True, include superseded observations. Default False."""
-    try:
-        store = _server_mod.store
+    import mcp_memory.server as _server_mod
 
-        if len(names) > MAX_ENTITIES_PER_CALL:
-            return {
-                "error": f"Too many entity names: {len(names)} > {MAX_ENTITIES_PER_CALL}. Request fewer entities at a time."
+    store = _server_mod.store
+
+    if len(names) > MAX_ENTITIES_PER_CALL:
+        return {
+            "error": f"Too many entity names: {len(names)} > {MAX_ENTITIES_PER_CALL}. Request fewer entities at a time."
+        }
+
+    # 1. Resolve names to entities (preserve input order)
+    entities_list = []
+    for name in names:
+        entity = store.get_entity_by_name(name)
+        if entity:
+            entities_list.append(entity)
+
+    if not entities_list:
+        return {"entities": []}
+
+    entity_ids = [e["id"] for e in entities_list]
+
+    # 2. Batch prefetch (4 queries total)
+    entities_map = store.get_entities_batch(entity_ids)
+    obs_map = store.get_observations_with_ids_batch(
+        entity_ids, exclude_superseded=not include_superseded
+    )
+    rel_map = store.get_relations_for_entity_batch(entity_ids)
+    ref_map = store.get_reflections_for_target_batch("entity", entity_ids)
+
+    # 3. Reconstruct results preserving input order
+    results = []
+    opened_ids = []
+    for entity in entities_list:
+        eid = entity["id"]
+        obs_data = obs_map.get(eid, [])
+        if kinds:
+            obs_data = [o for o in obs_data if o["kind"] in kinds]
+
+        rel_output = [
+            {
+                "relation_type": r["relation_type"],
+                "target_name": r["target_name"],
+                "direction": r["direction"],
+                "context": r["context"],
+                "active": bool(r["active"]),
+                "ended_at": r["ended_at"],
             }
+            for r in rel_map.get(eid, [])
+        ]
 
-        results = []
-        opened_ids = []
-        for name in names:
-            entity = store.get_entity_by_name(name)
-            if entity:
-                obs_data = store.get_observations_with_ids(
-                    entity["id"], exclude_superseded=not include_superseded
-                )
-                if kinds:
-                    obs_data = [o for o in obs_data if o["kind"] in kinds]
+        entity_reflections = ref_map.get(eid, [])
 
-                # Get relations with context, active, ended_at
-                entity_relations = store.get_relations_for_entity(entity["id"])
-                rel_output = [
-                    {
-                        "relation_type": r["relation_type"],
-                        "target_name": r["target_name"],
-                        "direction": r["direction"],
-                        "context": r["context"],
-                        "active": bool(r["active"]),
-                        "ended_at": r["ended_at"],
-                    }
-                    for r in entity_relations
-                ]
+        store.record_access(eid)
+        opened_ids.append(eid)
 
-                # Limbic: record access on node open
-                store.record_access(entity["id"])
-                opened_ids.append(entity["id"])
-                result_dict = _entity_to_output(entity, obs_data, relations=rel_output)
-                # Phase 4: Add reflections for this entity
-                entity_reflections = store.get_reflections_for_target(
-                    "entity", entity["id"]
-                )
-                result_dict["reflections"] = [
-                    {
-                        "id": r["id"],
-                        "author": r["author"],
-                        "content": r["content"],
-                        "mood": r["mood"],
-                        "created_at": r["created_at"],
-                    }
-                    for r in entity_reflections
-                ]
-                results.append(result_dict)
+        result_dict = _entity_to_output(entity, obs_data, relations=rel_output)
+        result_dict["reflections"] = entity_reflections
+        results.append(result_dict)
 
-        # Limbic: record co-occurrences for entities opened together (best-effort)
-        try:
-            if len(opened_ids) >= 2:
-                store.record_co_occurrences(opened_ids)
-        except Exception as e:
-            logger.warning("Limbic co-occurrence tracking failed: %s", e)
-
-        return {"entities": results}
+    # Limbic: record co-occurrences for entities opened together (best-effort)
+    try:
+        if len(opened_ids) >= 2:
+            store.record_co_occurrences(opened_ids)
     except Exception as e:
-        logger.error("Error in open_nodes: %s", e)
-        return {"error": str(e)}
+        logger.warning("Limbic co-occurrence tracking failed: %s", e)
+
+    return {"entities": results}
 
 
+@tool_error_handler
 def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
     """Semantic search using vector embeddings with optional full-text hybrid search.
     Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion,
     then applies limbic re-ranking based on access patterns and co-occurrence.
     Requires the embedding model to be downloaded (run download_model.py first)."""
-    try:
-        store = _server_mod.store
+    import mcp_memory.server as _server_mod
 
-        if len(query) > MAX_QUERY_LENGTH:
-            return {
-                "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
-            }
-        if limit > MAX_ENTITIES_PER_CALL:
-            return {
-                "error": f"Limit too high: {limit} > {MAX_ENTITIES_PER_CALL}. Request fewer results."
-            }
+    store = _server_mod.store
 
-        engine = _get_engine()
-        if not engine or not engine.available:
-            return {
-                "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
-            }
-
-        from mcp_memory.scoring import RoutingStrategy, detect_query_type
-
-        # Determine treatment and routing
-        treatment = _get_treatment(query)
-        routing_strategy = None
-        if treatment == 1:
-            routing_strategy = detect_query_type(query, limit)
-            logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
-
-        # Execute search
-        knn_results, fts_results, merged, candidate_ids, use_hybrid = (
-            _execute_hybrid_search(query, engine, limit)
-        )
-        if not knn_results:
-            return {"results": []}
-
-        # Collect data
-        baseline_ranked = _compute_baseline_ranking(knn_results)
-        access_data = store.get_access_data(candidate_ids)
-        degree_data = store.get_entity_degrees(candidate_ids)
-        cooc_data = store.get_co_occurrences(candidate_ids)
-        access_days_data = store.get_access_days(candidate_ids)
-
-        entity_created = {
-            eid: row["created_at"]
-            for eid, row in store.get_entities_batch(candidate_ids).items()
+    if len(query) > MAX_QUERY_LENGTH:
+        return {
+            "error": f"Query too long: {len(query)} > {MAX_QUERY_LENGTH} characters. Use a more concise search query."
+        }
+    if limit > MAX_ENTITIES_PER_CALL:
+        return {
+            "error": f"Limit too high: {limit} > {MAX_ENTITIES_PER_CALL}. Request fewer results."
         }
 
-        # Log shadow event
-        shadow_start_time = time.perf_counter()
-        try:
-            event_id = store.log_search_event(
-                query_text=query,
-                treatment=treatment,
-                k_limit=limit,
-                num_results=None,
-                duration_ms=None,
-                engine_used="limbic" if treatment == 1 else "baseline",
-            )
-        except Exception as e:
-            logger.warning("Shadow mode event logging failed: %s", e)
-            event_id = None
+    engine = _get_engine()
+    if not engine or not engine.available:
+        return {
+            "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
+        }
 
-        # Rank and apply deboosts
-        ranked = _rank_candidates(
-            treatment,
-            routing_strategy,
-            knn_results,
-            merged,
-            use_hybrid,
-            access_data,
-            degree_data,
-            cooc_data,
-            entity_created,
-            access_days_data,
-            limit,
-            baseline_ranked,
+    from mcp_memory.scoring import RoutingStrategy, detect_query_type
+
+    # Determine treatment and routing
+    treatment = _get_treatment(query)
+    routing_strategy = None
+    if treatment == 1:
+        routing_strategy = detect_query_type(query, limit)
+        logger.info(f"Query routing: '{query[:50]}...' -> {routing_strategy.value}")
+
+    # Execute search
+    knn_results, fts_results, merged, candidate_ids, use_hybrid = (
+        _execute_hybrid_search(query, engine, limit)
+    )
+    if not knn_results:
+        return {"results": []}
+
+    # Collect data
+    baseline_ranked = _compute_baseline_ranking(knn_results)
+    access_data = store.get_access_data(candidate_ids)
+    degree_data = store.get_entity_degrees(candidate_ids)
+    cooc_data = store.get_co_occurrences(candidate_ids)
+    access_days_data = store.get_access_days(candidate_ids)
+
+    entity_created = {
+        eid: row["created_at"]
+        for eid, row in store.get_entities_batch(candidate_ids).items()
+    }
+
+    # Log shadow event
+    shadow_start_time = time.perf_counter()
+    try:
+        event_id = store.log_search_event(
+            query_text=query,
+            treatment=treatment,
+            k_limit=limit,
+            num_results=None,
+            duration_ms=None,
+            engine_used="limbic" if treatment == 1 else "baseline",
         )
-        ranked = _apply_deboosts(ranked, treatment)
-
-        # Build output
-        output, top_k_ids = _build_search_output(
-            ranked, treatment, routing_strategy, use_hybrid
-        )
-
-        # Log and track
-        _log_shadow_and_track(
-            event_id, ranked, treatment, baseline_ranked, top_k_ids, shadow_start_time
-        )
-
-        return {"results": output}
-
     except Exception as e:
-        logger.error("Error in search_semantic: %s", e)
-        return {"error": str(e)}
+        logger.warning("Shadow mode event logging failed: %s", e)
+        event_id = None
+
+    # Rank and apply deboosts
+    ranked = _rank_candidates(
+        treatment,
+        routing_strategy,
+        knn_results,
+        merged,
+        use_hybrid,
+        access_data,
+        degree_data,
+        cooc_data,
+        entity_created,
+        access_days_data,
+        limit,
+        baseline_ranked,
+    )
+    ranked = _apply_deboosts(ranked, treatment)
+
+    # Build output
+    output, top_k_ids = _build_search_output(
+        ranked, treatment, routing_strategy, use_hybrid
+    )
+
+    # Log and track
+    _log_shadow_and_track(
+        event_id, ranked, treatment, baseline_ranked, top_k_ids, shadow_start_time
+    )
+
+    return {"results": output}

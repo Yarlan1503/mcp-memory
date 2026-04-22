@@ -239,6 +239,19 @@ class TestServerTools:
             "updated_at": "2024-01-01",
         }
         mock_store.get_observations_with_ids.return_value = []
+        mock_store.get_observations_with_ids_batch.return_value = {1: []}
+        mock_store.get_relations_for_entity_batch.return_value = {1: []}
+        mock_store.get_reflections_for_target_batch.return_value = {1: []}
+        mock_store.get_entities_batch.return_value = {
+            1: {
+                "id": 1,
+                "name": "TestEntity",
+                "entity_type": "Test",
+                "status": "pausado",
+                "created_at": "2024-01-01",
+                "updated_at": "2024-01-01",
+            }
+        }
         mock_store.get_access_data.return_value = {}
 
         from mcp_memory.server import open_nodes

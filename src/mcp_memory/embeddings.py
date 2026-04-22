@@ -223,7 +223,14 @@ class EmbeddingEngine:
         if not self._available:
             raise RuntimeError("Embedding model not available")
 
-        # 1. Tokenise ---------------------------------------------------
+        # 1. Tokenise with dynamic padding -----------------------------
+        # First pass: find max length without padding
+        self._tokenizer.no_padding()
+        encoded_raw = self._tokenizer.encode_batch(texts)
+        max_len = max(len(e.ids) for e in encoded_raw)
+
+        # Second pass: pad to the actual max length of this batch
+        self._tokenizer.enable_padding(length=max_len)
         encoded = self._tokenizer.encode_batch(texts)
 
         input_ids = np.array(

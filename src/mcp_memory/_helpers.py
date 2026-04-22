@@ -1,9 +1,27 @@
 """Shared helpers for MCP Memory tools."""
 
+import functools
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def tool_error_handler(func):
+    """Decorator that wraps tool functions with standard error handling.
+
+    Catches exceptions, logs them with logger.error, and returns {"error": str(e)}.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error("Error in %s: %s", func.__name__, e)
+            return {"error": str(e)}
+
+    return wrapper
 
 
 def _get_engine() -> Any:

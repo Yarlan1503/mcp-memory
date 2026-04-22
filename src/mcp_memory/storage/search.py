@@ -62,6 +62,18 @@ class SearchMixin:
     # Limbic: FTS5 full-text search
     # ------------------------------------------------------------------
 
+    def _format_obs_for_fts(self, obs_data: list[dict]) -> str:
+        """Format observation list into a single FTS text string."""
+        obs_parts = []
+        for o in obs_data:
+            kind = o.get("kind", "generic")
+            content = o["content"]
+            if kind != "generic":
+                obs_parts.append(f"[{kind}] {content}")
+            else:
+                obs_parts.append(content)
+        return " | ".join(obs_parts)
+
     @retry_on_locked
     def _sync_fts(self, entity_id: int) -> None:
         """Rebuild FTS index entry for an entity from current DB state.
@@ -75,15 +87,7 @@ class SearchMixin:
             obs_data = self.get_observations_with_ids(
                 entity_id, exclude_superseded=True
             )
-            obs_parts = []
-            for o in obs_data:
-                kind = o.get("kind", "generic")
-                content = o["content"]
-                if kind != "generic":
-                    obs_parts.append(f"[{kind}] {content}")
-                else:
-                    obs_parts.append(content)
-            obs_text = " | ".join(obs_parts)
+            obs_text = self._format_obs_for_fts(obs_data)
             self.db.execute(
                 "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
                 (entity_id, entity["name"], entity["entity_type"], obs_text),
@@ -105,15 +109,7 @@ class SearchMixin:
                 obs_data = self.get_observations_with_ids(
                     e["id"], exclude_superseded=True
                 )
-                obs_parts = []
-                for o in obs_data:
-                    kind = o.get("kind", "generic")
-                    content = o["content"]
-                    if kind != "generic":
-                        obs_parts.append(f"[{kind}] {content}")
-                    else:
-                        obs_parts.append(content)
-                obs_text = " | ".join(obs_parts)
+                obs_text = self._format_obs_for_fts(obs_data)
                 self.db.execute(
                     "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
                     (e["id"], e["name"], e["entity_type"], obs_text),

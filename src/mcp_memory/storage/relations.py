@@ -181,3 +181,64 @@ class RelationsMixin:
                     }
                 )
         return result
+
+    def find_inverse_relation(self, from_entity_id: int, to_entity_id: int, relation_type: str) -> dict | None:
+        """Find an active inverse relation by swapped entities and inverse type.
+
+        Returns the relation dict with id and active status if found and active,
+        otherwise None.
+        """
+        row = self.db.execute(
+            "SELECT id, active FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
+            (to_entity_id, from_entity_id, relation_type),
+        ).fetchone()
+        if row and row["active"] == 1:
+            return dict(row)
+        return None
+
+    def get_relations_for_entity_batch(self, entity_ids: list[int]) -> dict[int, list[dict]]:
+        """Get all relations for multiple entities in a single query.
+
+        Returns dict mapping entity_id -> list of relation dicts with
+        relation_type, target_name, direction, context, active, ended_at.
+        """
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"""
+            SELECT r.id, r.from_entity, r.to_entity, r.relation_type,
+                   r.context, r.active, r.ended_at,
+                   e_from.name AS from_name, e_to.name AS to_name
+            FROM relations r
+            JOIN entities e_from ON r.from_entity = e_from.id
+            JOIN entities e_to ON r.to_entity = e_to.id
+            WHERE r.from_entity IN ({placeholders}) OR r.to_entity IN ({placeholders})
+            """,
+            entity_ids + entity_ids,
+        ).fetchall()
+        result = {eid: [] for eid in entity_ids}
+        for r in rows:
+            if r["from_entity"] in result:
+                result[r["from_entity"]].append(
+                    {
+                        "relation_type": r["relation_type"],
+                        "target_name": r["to_name"],
+                        "direction": "from",
+                        "context": r["context"],
+                        "active": r["active"],
+                        "ended_at": r["ended_at"],
+                    }
+                )
+            if r["to_entity"] in result:
+                result[r["to_entity"]].append(
+                    {
+                        "relation_type": r["relation_type"],
+                        "target_name": r["from_name"],
+                        "direction": "to",
+                        "context": r["context"],
+                        "active": r["active"],
+                        "ended_at": r["ended_at"],
+                    }
+                )
+        return result

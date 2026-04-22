@@ -275,18 +275,47 @@ class TestServerTools:
                 "superseded_at": None,
             },
         ]
+        mock_store.get_observations_with_ids_batch.return_value = {
+            1: [
+                {
+                    "id": 1,
+                    "content": "obs1",
+                    "similarity_flag": 0,
+                    "kind": "generic",
+                    "supersedes": None,
+                    "superseded_at": None,
+                },
+                {
+                    "id": 2,
+                    "content": "obs2",
+                    "similarity_flag": 0,
+                    "kind": "generic",
+                    "supersedes": None,
+                    "superseded_at": None,
+                },
+            ]
+        }
+        mock_store.get_relations_for_entity_batch.return_value = {1: []}
+        mock_store.get_reflections_for_target_batch.return_value = {1: []}
+        mock_store.get_entities_batch.return_value = {
+            1: {
+                "id": 1,
+                "name": "TestEntity",
+                "entity_type": "Test",
+            }
+        }
 
     @patch("mcp_memory.server.store")
     def test_open_nodes_default_excludes_superseded(self, mock_store):
-        """open_nodes by default calls get_observations_with_ids with exclude_superseded=True."""
+        """open_nodes by default calls get_observations_with_ids_batch with exclude_superseded=True."""
         self._setup_store_mock(mock_store)
 
         from mcp_memory.server import open_nodes
 
         result = open_nodes(names=["TestEntity"])
 
-        mock_store.get_observations_with_ids.assert_called_with(
-            1, exclude_superseded=True
+        mock_store.get_observations_with_ids_batch.assert_called_with(
+            [1], exclude_superseded=True
         )
         assert "entities" in result
 
@@ -299,8 +328,8 @@ class TestServerTools:
 
         result = open_nodes(names=["TestEntity"], include_superseded=True)
 
-        mock_store.get_observations_with_ids.assert_called_with(
-            1, exclude_superseded=False
+        mock_store.get_observations_with_ids_batch.assert_called_with(
+            [1], exclude_superseded=False
         )
 
     @patch("mcp_memory.server.store")
@@ -311,24 +340,35 @@ class TestServerTools:
             "name": "TestEntity",
             "entity_type": "Test",
         }
-        mock_store.get_observations_with_ids.return_value = [
-            {
+        mock_store.get_observations_with_ids_batch.return_value = {
+            1: [
+                {
+                    "id": 1,
+                    "content": "obs1",
+                    "similarity_flag": 0,
+                    "kind": "hallazgo",
+                    "supersedes": None,
+                    "superseded_at": None,
+                },
+                {
+                    "id": 2,
+                    "content": "obs2",
+                    "similarity_flag": 0,
+                    "kind": "generic",
+                    "supersedes": None,
+                    "superseded_at": None,
+                },
+            ]
+        }
+        mock_store.get_relations_for_entity_batch.return_value = {1: []}
+        mock_store.get_reflections_for_target_batch.return_value = {1: []}
+        mock_store.get_entities_batch.return_value = {
+            1: {
                 "id": 1,
-                "content": "obs1",
-                "similarity_flag": 0,
-                "kind": "hallazgo",
-                "supersedes": None,
-                "superseded_at": None,
-            },
-            {
-                "id": 2,
-                "content": "obs2",
-                "similarity_flag": 0,
-                "kind": "generic",
-                "supersedes": None,
-                "superseded_at": None,
-            },
-        ]
+                "name": "TestEntity",
+                "entity_type": "Test",
+            }
+        }
 
         from mcp_memory.server import open_nodes
 

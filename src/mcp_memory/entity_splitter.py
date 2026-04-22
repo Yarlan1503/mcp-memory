@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import sqlite3
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
@@ -898,7 +899,15 @@ def execute_entity_split(
     new_entity_ids: list[int] = []
     observations_moved = 0
 
-    with store.db:
+    # NOTE: The CRUD methods called below (upsert_entity, add_observations,
+    # create_relation, delete_observations) perform internal commits. SQLite
+    # savepoints cannot roll back changes that have already been committed by
+    # those methods. For true atomicity the store would need an auto_commit=False
+    # flag (or similar) so that the split transaction controls all commits.
+    # Until then this savepoint provides best-effort containment for failures
+    # that happen between the explicit commits inside the loop.
+    store.db.execute("SAVEPOINT split")
+    try:
         # Create new entities and add observations
         for split in approved_splits:
             split_name = split["name"]
@@ -937,6 +946,20 @@ def execute_entity_split(
                 deleted,
                 entity_name,
             )
+        try:
+            store.db.execute("RELEASE SAVEPOINT split")
+        except sqlite3.OperationalError:
+            # Savepoint was consumed by internal commits from CRUD methods.
+            pass
+    except Exception:
+        try:
+            store.db.execute("ROLLBACK TO SAVEPOINT split")
+            store.db.execute("RELEASE SAVEPOINT split")
+        except sqlite3.OperationalError:
+            # Savepoint was consumed by an internal commit from a CRUD method;
+            # rollback is no longer possible. This is a known limitation.
+            pass
+        raise
 
     # Get remaining observations in original entity
     remaining_obs = store.get_observations(original_id)

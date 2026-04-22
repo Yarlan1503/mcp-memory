@@ -313,3 +313,64 @@ class TestAutoDownload:
                     engine = EmbeddingEngine()
                     with pytest.raises(RuntimeError, match="not available"):
                         engine.encode(["test"])
+
+
+class TestEncodeIntegration:
+    """Integration tests for encode() with real ONNX model."""
+
+    @pytest.fixture(scope="class", autouse=True)
+    def reset_singleton(self):
+        """Reset singleton once before all tests in this class."""
+        EmbeddingEngine.reset()
+        yield
+        EmbeddingEngine.reset()
+
+    def test_encode_returns_correct_shape(self):
+        """encode() returns arrays with expected shapes."""
+        engine = EmbeddingEngine.get_instance()
+        if not engine.available:
+            pytest.skip("Embedding model not available")
+
+        # Single text
+        result = engine.encode(["Hello world"])
+        assert result.shape == (1, DIMENSION)
+        assert result.dtype == np.float32
+
+        # Multiple texts
+        result = engine.encode(["One", "Two", "Three"])
+        assert result.shape == (3, DIMENSION)
+
+        # Empty list
+        result = engine.encode([])
+        assert result.shape == (0, DIMENSION)
+
+    def test_dynamic_padding_preserves_outputs(self):
+        """Dynamic padding produces the same embeddings as fixed padding (512)."""
+        engine = EmbeddingEngine.get_instance()
+        if not engine.available:
+            pytest.skip("Embedding model not available")
+
+        texts = [
+            "Hola mundo",
+            "El rápido zorro marrón salta sobre el perro perezoso cada mañana.",
+            "La inteligencia artificial está transformando rápidamente múltiples industrias.",
+            "Python es genial.",
+            "12345",
+            "¿Cómo estás? ¡Bien!",
+            "a",
+            "Un texto medianamente largo que debería tener alrededor de treinta o cuarenta tokens en total.",
+            "Embeddings semánticos para búsqueda vectorial en sqlite-vec.",
+            "Último texto de prueba con acentos: áéíóúüñ.",
+        ]
+
+        # Current implementation (dynamic padding)
+        dynamic = engine.encode(texts)
+        assert dynamic.shape == (len(texts), DIMENSION)
+
+        # Simulate fixed padding (512)
+        engine._tokenizer.enable_padding(length=512)
+        fixed = engine.encode(texts)
+        assert fixed.shape == (len(texts), DIMENSION)
+
+        # All outputs must be within atol=1e-4
+        assert np.allclose(dynamic, fixed, atol=1e-4)

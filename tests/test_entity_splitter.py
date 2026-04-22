@@ -699,3 +699,48 @@ class TestSemanticIntegration:
         result = analyze_entity_for_split(store_with_schema, "CrashTest")
         assert result is not None
         assert result["needs_split"] is True
+
+
+@pytest.mark.xfail(
+    reason="CRUD methods commit internally; SQLite savepoints cannot roll back committed work. Needs auto_commit=False flag in store methods.",
+    strict=False,
+)
+def test_entity_split_rollback_on_failure(store_with_schema, monkeypatch):
+    """Split failure mid-loop should leave DB in original state (atomic)."""
+    store = store_with_schema
+    # 1. Create original entity with 3 obs
+    eid = store.upsert_entity("Original", "Type")
+    store.add_observations(eid, ["obs1", "obs2", "obs3"])
+
+    # 2. Count before
+    entities_before = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    obs_before = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+
+    # 3. Approved splits: 2 splits, will fail during second iteration
+    approved_splits = [
+        {"name": "SplitA", "entity_type": "Type", "observations": ["obs1"]},
+        {"name": "SplitB", "entity_type": "Type", "observations": ["obs2"]},
+    ]
+
+    # Make create_relation raise after the first split is fully processed
+    call_count = 0
+    original_create_relation = store.create_relation
+
+    def _failing_create_relation(from_id, to_id, rel_type, context=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 2:  # fail during second split
+            raise RuntimeError("simulated failure mid-split")
+        return original_create_relation(from_id, to_id, rel_type, context)
+
+    monkeypatch.setattr(store, "create_relation", _failing_create_relation)
+
+    # 4. Execute — must raise
+    with pytest.raises(RuntimeError, match="simulated failure mid-split"):
+        execute_entity_split(store, "Original", approved_splits)
+
+    # 5. Verify counts rolled back
+    entities_after = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    obs_after = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    assert entities_after == entities_before
+    assert obs_after == obs_before

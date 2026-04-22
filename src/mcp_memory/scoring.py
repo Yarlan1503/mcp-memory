@@ -183,6 +183,23 @@ def compute_importance(
     return access_norm * (1 + BETA_DEG * degree_norm) * cons_multiplier
 
 
+def _compute_recency_factor(created_at_str: str) -> float:
+    """Compute recency factor from a SQLite datetime string.
+
+    recency = max(TEMPORAL_FLOOR, exp(-LAMBDA_HOURLY × Δt_hours))
+
+    Returns 1.0 if the string cannot be parsed.
+    """
+    try:
+        dt = _parse_sqlite_datetime(created_at_str)
+    except (ValueError, TypeError):
+        return 1.0
+
+    now = datetime.now(timezone.utc)
+    delta_hours = max(0.0, (now - dt).total_seconds() / 3600.0)
+    return max(TEMPORAL_FLOOR, math.exp(-LAMBDA_HOURLY * delta_hours))
+
+
 def compute_temporal_factor(last_access_str: str, created_at_str: str) -> float:
     """Compute temporal decay factor.
 
