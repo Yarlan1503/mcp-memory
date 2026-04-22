@@ -25,7 +25,7 @@ A **drop-in replacement** for [Anthropic's MCP Memory server](https://github.com
 - **Reflections** -- independent narrative layer: free-form prose attached to entities/sessions/relations/global, with author and mood metadata, searchable via semantic + FTS5 hybrid search
 - **Lightweight** -- ~500 MB total vs ~1.4 GB for similar solutions
 - **Migration** -- one-click import from Anthropic's JSONL format
-- **Zero config** -- works out of the box, optional model download for semantic search
+- **Zero config** -- works out of the box; embedding model auto-downloads on first use
 
 ## Quick Start
 
@@ -55,12 +55,16 @@ Or clone and run locally:
 
 ### 2. Enable semantic search (optional)
 
+The embedding model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, ~465 MB, ONNX CPU, 384-dim) is **auto-downloaded** on first use when any semantic tool is called. No manual setup is required.
+
+If you prefer to pre-download it:
+
 ```bash
 cd /path/to/mcp-memory
 uv run python scripts/download_model.py
 ```
 
-This downloads a multilingual sentence model (~465 MB) to `~/.cache/mcp-memory-v2/models/`. Without it, all tools work fine -- only `search_semantic` will be unavailable.
+This is a thin wrapper that downloads the same files to `~/.cache/mcp-memory-v2/models/`. Without the model, all non-semantic tools work fine -- only `search_semantic` will be unavailable.
 
 ### 3. Migrate existing data (optional)
 
@@ -79,36 +83,44 @@ print(result)
 
 ## MCP Tools
 
+**19 tools** total, grouped by function:
+
 ### Core (Anthropic-compatible)
 
 | Tool | Description |
 |------|-------------|
 | `create_entities` | Create or update entities (merges observations on conflict). Accepts `status` field. |
-| `create_relations` | Create typed relations between entities. Accepts `context`; auto-creates inverse relations where defined. |
+| `create_relations` | Create typed relations between entities. Accepts `context`; auto-creates inverse relations for `contiene`/`parte_de`. |
 | `add_observations` | Add observations to an existing entity. Accepts `kind` and `supersedes` params for semantic classification and explicit replacement. |
 | `delete_entities` | Delete entities and all their relations/observations |
 | `delete_observations` | Delete specific observations from an entity |
 | `delete_relations` | Delete specific relations between entities |
-| `search_nodes` | Search by substring (name, type, observation content) |
-| `open_nodes` | Retrieve entities by name. Accepts `kinds` filter, `include_superseded` flag. Returns `reflections` and relation metadata (context, active, ended_at). |
 
-### Search & Analysis
+### Search & Retrieval
 
 | Tool | Description |
 |------|-------------|
+| `search_nodes` | Search by substring (name, type, observation content) |
+| `open_nodes` | Retrieve entities by name. Accepts `kinds` filter, `include_superseded` flag. Returns `reflections` and relation metadata (context, active, ended_at). |
 | `search_semantic` | Semantic search via vector embeddings with **Limbic Scoring** re-ranking |
+
+### Entity Management & Analysis
+
+| Tool | Description |
+|------|-------------|
+| `analyze_entity_split` | Analyze if an entity needs splitting (semantic clustering + TF-IDF fallback) |
+| `propose_entity_split_tool` | Propose a split with suggested entity names and relations |
+| `execute_entity_split_tool` | Execute an approved split (atomic transaction) |
+| `find_split_candidates` | Find all entities that need splitting |
 | `find_duplicate_observations` | Find semantically duplicated observations within an entity (cosine + containment) |
 | `consolidation_report` | Generate a read-only consolidation report (split candidates, flagged obs, stale entities) |
 
-### Entity Management
+### Relation Management
 
 | Tool | Description |
 |------|-------------|
 | `migrate` | Import from Anthropic's JSONL format (idempotent) |
-| `analyze_entity_split` | Analyze if an entity needs splitting (TF-IDF topic grouping) |
-| `propose_entity_split_tool` | Propose a split with suggested entity names and relations |
-| `execute_entity_split_tool` | Execute an approved split (atomic transaction) |
-| `find_split_candidates` | Find all entities that need splitting |
+| `end_relation` | Expire an active relation by setting `active=0` and `ended_at=now`. Also expires the inverse `contiene`↔`parte_de` pair. |
 
 ### Reflections
 
@@ -148,16 +160,21 @@ Semantic classification for observations:
 
 ## Relation Types
 
-4 categories:
+Relation types are **free-form** (no restrictive enum). The only hardcoded inverse pair is:
 
-| Category | Types | Example |
-|----------|-------|---------|
-| Structural | `contiene` / `parte_de` | Project contains Session |
-| Production | `producido_por`, `contribuye_a` | Session produces Decision |
-| Dependency | `depende_de`, `usa` | Project depends on System |
-| Succession | `continua`, `sucedido_por` | Session continues Session |
+| Type | Inverse | Auto-created |
+|------|---------|--------------|
+| `contiene` | `parte_de` | Yes |
+| `parte_de` | `contiene` | Yes |
 
-Inverse relations are auto-created for `contiene`/`parte_de` pairs.
+Common conventions used in the knowledge graph (not enforced):
+
+- **Structural**: `contiene` / `parte_de`
+- **Production**: `producido_por`, `contribuye_a`
+- **Dependency**: `depende_de`, `usa`
+- **Temporal**: `continua` (legacy mapping → `contribuye_a`), `sucedido_por`
+
+Legacy types are normalized at creation time via `_constants.py`: `continua` → `contribuye_a` (with context "sesión continuación"), `documentado_en` → `producido_por` (with context "documentado en").
 
 ## Architecture
 
@@ -169,7 +186,7 @@ server.py (97 lines)          — FastMCP init + tool registration
 │   ├── entity_mgmt.py       — 6 entity management tools
 │   ├── reflections.py       — 2 reflection tools
 │   └── relations.py         — 2 tools (migrate, end_relation)
-├── storage/                  — 7 mixins via multiple inheritance
+├── storage/                  — 7 mixins + constants via multiple inheritance
 │   ├── __init__.py           — MemoryStore facade (134 lines)
 │   ├── schema.py            — SchemaMixin (migrations)
 │   ├── core.py              — CoreMixin (entity/obs CRUD)
@@ -177,10 +194,11 @@ server.py (97 lines)          — FastMCP init + tool registration
 │   ├── search.py            — SearchMixin (FTS + embeddings)
 │   ├── access.py            — AccessMixin
 │   ├── reflections.py       — ReflectionsMixin
-│   └── consolidation.py     — ConsolidationMixin
-├── embeddings.py             — EmbeddingEngine (ONNX, lazy load)
+│   ├── consolidation.py     — ConsolidationMixin
+│   └── _constants.py        — Inverse relation & validation constants
+├── embeddings.py             — EmbeddingEngine (ONNX, lazy load, auto-download)
 ├── scoring.py                — Limbic Scoring + RRF
-├── entity_splitter.py        — TF-IDF entity splitting
+├── entity_splitter.py        — Semantic clustering (Agglomerative + c-TF-IDF fallback)
 ├── retry.py                  — retry_on_locked (concurrency)
 └── config.py                 — Input limits + A/B config
 ```
@@ -188,7 +206,7 @@ server.py (97 lines)          — FastMCP init + tool registration
 - **Storage**: SQLite with WAL journaling, 5-second busy timeout, CASCADE deletes
 - **Embeddings**: Singleton ONNX model loaded once at startup, L2-normalized cosine search
 - **Limbic Scoring**: Re-ranks hybrid (KNN + FTS5) candidates using importance signals, temporal decay, co-occurrence patterns, and RRF scores -- transparent to the API
-- **Concurrency**: `retry_on_locked` decorator with exponential backoff + jitter on 21 write methods. Safe multi-client access (tested with concurrent opencode sessions)
+- **Concurrency**: `retry_on_locked` decorator with exponential backoff + jitter on 19 write methods. Safe multi-client access (tested with concurrent opencode sessions)
 - **Reflections**: Parallel FTS5 (`reflection_fts`) and vector (`reflection_embeddings`) indexes for narrative layer, searched via the same RRF hybrid pipeline
 
 ## How It Works
@@ -221,7 +239,7 @@ The output includes `limbic_score`, `scoring` (importance/temporal/cooc breakdow
 uv run pytest tests/ -v
 ```
 
-313 tests across 15 test files covering all tools, embeddings, scoring, and edge cases. Zero regressions.
+402 tests across 23 test files covering all tools, embeddings, scoring, and edge cases. Zero regressions.
 
 ## Requirements
 
@@ -238,6 +256,7 @@ uv run pytest tests/ -v
 | `onnxruntime` | ONNX model inference (CPU) |
 | `tokenizers` | HuggingFace fast tokenizer |
 | `numpy` | Vector operations |
+| `scipy>=1.11` | Semantic clustering for entity splitting |
 | `huggingface-hub` | Model download |
 
 ## License

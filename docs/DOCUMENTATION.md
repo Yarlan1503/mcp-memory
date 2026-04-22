@@ -44,7 +44,7 @@ El servidor oficial reescribe el archivo completo en cada operación. Sin lockin
 
 ### Compatibilidad con Anthropic MCP Memory
 
-De las 10 tools que expone MCP Memory v2, **8 son 100% compatibles** con la API de Anthropic:
+De las 19 tools que expone MCP Memory v2, **8 son 100% compatibles** con la API de Anthropic:
 
 | Tool | Compatibilidad |
 |---|---|
@@ -56,10 +56,19 @@ De las 10 tools que expone MCP Memory v2, **8 son 100% compatibles** con la API 
 | `delete_relations` | ✅ Anthropic |
 | `search_nodes` | ✅ Anthropic |
 | `open_nodes` | ✅ Anthropic |
-| `search_semantic` | 🆕 Nueva |
-| `migrate` | 🆕 Nueva |
+| `search_semantic` | 🆕 Propia |
+| `migrate` | 🆕 Propia |
+| `end_relation` | 🆕 Propia |
+| `find_duplicate_observations` | 🆕 Propia |
+| `consolidation_report` | 🆕 Propia |
+| `add_reflection` | 🆕 Propia |
+| `search_reflections` | 🆕 Propia |
+| `analyze_entity_split` | 🆕 Propia |
+| `propose_entity_split_tool` | 🆕 Propia |
+| `execute_entity_split_tool` | 🆕 Propia |
+| `find_split_candidates` | 🆕 Propia |
 
-Las dos tools nuevas extienden la funcionalidad sin romper la API existente:
+Las 11 tools propias extienden la funcionalidad sin romper la API existente:
 
 - **`search_semantic`** — Búsqueda por similitud semántica usando embeddings vectoriales. Encuentra entidades relevantes aunque no compartan palabras clave con la consulta.
 - **`migrate`** — Migración idempotente desde el formato JSONL de Anthropic a SQLite. Procesa el archivo línea por línea, ignora líneas corruptas, y genera embeddings para todas las entidades importadas.
@@ -75,6 +84,7 @@ Python >= 3.12
 ├── ONNX Runtime >= 1.17    # Inferencia de embeddings en CPU
 ├── HuggingFace tokenizers  # Tokenización rápida (Rust)
 ├── numpy >= 1.26           # Vectores y operaciones numéricas
+├── scipy >= 1.11           # Álgebra lineal y clustering (entity splitting)
 └── pydantic >= 2.0         # Validación de inputs/outputs
 ```
 
@@ -84,16 +94,15 @@ Python >= 3.12
 
 ### Modelo de embeddings
 
-El motor semántico usa **intfloat/multilingual-e5-small** (modelo de retrieval asimétrico entrenado por Intel):
+El motor semántico usa **sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2** (modelo sentence-transformers multilingüe, 384 dims, ONNX CPU):
 
 - **Dimensiones**: 384 (float32, ONNX FP32)
-- **Idiomas**: 94+ (incluyendo español, inglés, francés, alemán, chino, japonés)
+- **Idiomas**: 50+ (incluyendo español, inglés, francés, alemán, chino, japonés)
 - **Runtime**: CPU puro (no requiere GPU)
 - **Tamaño**: ~465 MB (modelo ONNX + tokenizer)
 - **Cache**: `~/.cache/mcp-memory-v2/models/`
-- **Prefixes**: `"query: "` para consultas, `"passage: "` para entidades y documentos (requisito del modelo e5)
 
-El pipeline de encoding: prepend prefix → tokenización → forward ONNX → mean pooling (masking de PAD) → normalización L2. Los vectores resultantes se serializan a raw bytes para almacenarlos en sqlite-vec.
+El pipeline de encoding: tokenización → forward ONNX → mean pooling (masking de PAD) → normalización L2. Los vectores resultantes se serializan a raw bytes para almacenarlos en sqlite-vec.
 
 ---
 
@@ -113,8 +122,8 @@ MCP Memory v2 sigue una arquitectura en capas con tres componentes principales: 
 ┌──────────────────────────────────────┐
 │         FastMCP Server               │
 │  ┌────────────────────────────┐      │
-│  │   10 MCP Tools             │      │
-│  │   (8 Anthropic + 2 new)    │      │
+│  │   19 MCP Tools             │      │
+│  │   (8 Anthropic + 11 new)   │      │
 │  └────┬──────────────┬────────┘      │
 │       │              │               │
 │  ┌────▼──────┐ ┌────▼──────────┐     │
@@ -213,7 +222,7 @@ La búsqueda semántica usa KNN sobre los vectores almacenados en sqlite-vec, co
 │  ┌──────────┐ ┌───────────┐ │
 │  │ KNN      │ │ FTS5      │ │
 │  │ encode   │ │ BM25 on   │ │
-│  │ (query:) │ │ name/type │ │
+│  │ (query)  │ │ name/type │ │
 │  │ → 3×lim  │ │ /obs_text │ │
 │  └────┬─────┘ └─────┬─────┘ │
 └───────┼──────────────┼───────┘
@@ -275,12 +284,19 @@ PRAGMA foreign_keys  = ON       # Integridad referencial
 
 | Tabla | Propósito |
 |---|---|
-| `entities` | Nodos del grafo (id, name, entity_type, timestamps) |
-| `observations` | Datos adjuntos a entidades (entity_id FK, content) |
-| `relations` | Aristas del grafo (from_entity, to_entity, relation_type) |
+| `entities` | Nodos del grafo (id, name, entity_type, status, timestamps) |
+| `observations` | Datos adjuntos a entidades (entity_id FK, content, kind, supersedes, superseded_at, similarity_flag) |
+| `relations` | Aristas del grafo (from_entity, to_entity, relation_type, context, active, ended_at) |
 | `db_metadata` | Metadatos clave-valor del sistema |
 | `entity_embeddings` (vec0) | Tabla virtual sqlite-vec para vectores float[384] |
 | `entity_fts` (FTS5) | Tabla virtual para búsqueda de texto completo (BM25) sobre nombres, tipos y observaciones |
+| `entity_access_log` | Log de acceso diario por entidad (entity_id, access_date, access_count) |
+| `reflections` | Reflexiones narrativas sobre entidades, relaciones o sesiones |
+| `reflection_fts` (FTS5) | Índice FTS5 para búsqueda de texto en reflexiones |
+| `reflection_embeddings` (vec0) | Tabla virtual sqlite-vec para embeddings de reflexiones |
+| `search_events` | Eventos de búsqueda semántica (query, timestamp, treatment, engine) |
+| `search_results` | Resultados por evento de búsqueda (rank, limbic_score, cosine_sim) |
+| `implicit_feedback` | Feedback implícito post-búsqueda (re_accessed, access_delta) |
 
 **Índices**: Se crean índices sobre `observations(entity_id)`, `relations(from_entity)`, `relations(to_entity)`, `relations(relation_type)`, `entities(name)` y `entities(entity_type)`.
 
@@ -339,8 +355,9 @@ Texto de entrada
        ▼
 ┌──────────────┐
 │  Tokenizer   │  HuggingFace fast tokenizer
-│  (trunc=512, │  input_ids + attention_mask
-│   pad=512)   │  → int64 arrays
+│  (trunc=512, │  Pass 1: no padding → compute max_len
+│  dynamic pad)│  Pass 2: enable_padding(length=max_len)
+│              │  input_ids + attention_mask → int64 arrays
 └──────┬───────┘
        │
        ▼
@@ -368,7 +385,7 @@ Texto de entrada
 "{name} ({entity_type}) | {obs1} | {obs2} | ... | Rel: tipo → destino; ..."
 ```
 
-Este formato permite que el embedding capture el nombre, tipo, observaciones clave y contexto relacional, respetando el límite de 480 tokens del modelo e5-small.
+Este formato permite que el embedding capture el nombre, tipo, observaciones clave y contexto relacional, respetando el límite de 480 tokens del modelo.
 
 ---
 
@@ -394,13 +411,14 @@ uv sync
 
 ### Descarga del Modelo de Embeddings
 
-El servidor usa un modelo ONNX de sentence-transformers para búsqueda semántica. Descárgalo antes de usar `search_semantic`:
+El servidor usa un modelo ONNX de sentence-transformers para búsqueda semántica. Si los archivos no están presentes en `~/.cache/mcp-memory-v2/models/`, el motor los **descarga automáticamente** desde HuggingFace la primera vez que se necesitan (por ejemplo, al invocar `search_semantic` o cualquier operación CRUD que genere embeddings).
 
 ```bash
+# Opcional: descarga manual (thin wrapper sobre la lógica de auto-download)
 uv run python scripts/download_model.py
 ```
 
-Esto descarga los siguientes archivos a `~/.cache/mcp-memory-v2/models/`:
+Archivos gestionados en `~/.cache/mcp-memory-v2/models/`:
 
 | Archivo | Origen en el repositorio HF |
 |---------|-----------------------------|
@@ -409,9 +427,9 @@ Esto descarga los siguientes archivos a `~/.cache/mcp-memory-v2/models/`:
 | `tokenizer_config.json` | Raíz |
 | `special_tokens_map.json` | Raíz |
 
-**Fuente del modelo**: [intfloat/multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small)
+**Fuente del modelo**: [sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
 
-> **Nota:** Esta descarga es opcional. El servidor arranca sin el modelo (ver [Lazy loading del modelo](#nota-sobre-el-modelo-de-embeddings)).
+> **Nota:** No es necesario ejecutar `download_model.py` antes de usar `search_semantic`. La descarga automática se dispara bajo demanda. Si falla (por ejemplo, sin conectividad), las herramientas no semánticas siguen funcionando normalmente (ver [Lazy loading del modelo](#nota-sobre-el-modelo-de-embeddings)).
 
 ### Ejecución del Servidor
 
@@ -470,7 +488,7 @@ Comportamiento según disponibilidad del modelo:
 |-----------|---------------|
 | Modelo descargado | Búsqueda semántica y generación de embeddings funcionan normalmente |
 | Modelo **no** descargado | `search_semantic` retorna un error claro: `Embedding model not available. Run 'python scripts/download_model.py' to download the model first.` |
-| Modelo **no** descargado | Las demás 10 tools (CRUD de entidades, relaciones, observaciones, lectura del grafo, migración) funcionan sin afectación |
+| Modelo **no** descargado | Las demás 19 tools (CRUD de entidades, relaciones, observaciones, lectura del grafo, migración, gestión y reflexiones) funcionan sin afectación |
 
 ---
 
@@ -487,6 +505,7 @@ Comportamiento según disponibilidad del modelo:
 | `tokenizers` | >= 0.19 | Tokenización rápida de HuggingFace para el modelo de embeddings |
 | `onnxruntime` | >= 1.17 | Inferencia ONNX en CPU para el modelo de embeddings |
 | `huggingface-hub` | >= 0.20 | Descarga de modelos desde HuggingFace Hub |
+| `scipy` | >= 1.11 | Álgebra lineal y clustering (entity splitting) |
 
 ### Desarrollo
 
@@ -518,44 +537,95 @@ Las entidades representan nodos del grafo. Las observaciones son hechos atados a
 ### Diagrama Entidad-Relación
 
 ```
-  ┌──────────────┐       ┌─────────────────┐
-  │   entities   │──1:N──│  observations   │
-  │              │       │                 │
-  │  id (PK)     │       │  id (PK)        │
-  │  name        │       │  entity_id (FK) │
-  │  entity_type │       │  content        │
-  │  created_at  │       │  created_at     │
-  │  updated_at  │       └─────────────────┘
+  ┌──────────────┐       ┌─────────────────────────────┐
+  │   entities   │──1:N──│        observations         │
+  │              │       │                             │
+  │  id (PK)     │       │  id (PK)                    │
+  │  name        │       │  entity_id (FK)             │
+  │  entity_type │       │  content                    │
+  │  status      │       │  kind                       │
+  │  created_at  │       │  supersedes → observations  │
+  │  updated_at  │       │  superseded_at              │
+  │              │       │  similarity_flag            │
+  │              │       │  created_at                 │
+  │              │       └─────────────────────────────┘
   │              │
-  │              │──N:1──┌─────────────────┐
-  │              │       │   relations     │
-  │              │◄──────│                 │
-  │              │ from  │  id (PK)        │
-  └──────┬───────┘       │  from_entity(FK)│
-         │               │  to_entity  (FK)│
-         │               │  relation_type  │
-         │               │  created_at     │
-         │               │  UNIQUE(from,   │
-         │               │    to, type)    │
-         │               └────────┬────────┘
-         │                        │
-         │  ┌─────────────────┐   │
-         └──│entity_embeddings│   │
-     1:1  │  (VIRTUAL)      │   │
-              │  rowid = id    │   │
-              │  embedding[384]│   │
-              │  cosine dist.  │   │
-              └─────────────────┘
+  │              │──N:1──┌─────────────────────────────┐
+  │              │       │         relations           │
+  │              │◄──────│                             │
+  │              │ from  │  id (PK)                    │
+  └──────┬───────┘       │  from_entity (FK)           │
+         │               │  to_entity   (FK)           │
+         │               │  relation_type              │
+         │               │  context                    │
+         │               │  active                     │
+         │               │  ended_at                   │
+         │               │  created_at                 │
+         │               │  UNIQUE(from,to,type)       │
+         │               └─────────────┬───────────────┘
+         │                             │
+         │  ┌─────────────────────┐    │
+         └──│  entity_embeddings  │    │
+     1:1    │    (VIRTUAL vec0)   │    │
+              │  rowid = id         │    │
+              │  embedding[384]     │    │
+              │  cosine dist.       │    │
+              └─────────────────────┘    │
+                                         │
+  ┌─────────────────┐        ┌──────────┴──────────────┐
+  │  entity_access  │        │    co_occurrences       │
+  │                 │        │                         │
+  │  entity_id (PK  │        │  entity_a_id (PK → e)   │
+  │    → entities)  │        │  entity_b_id (PK → e)   │
+  │  access_count   │        │  co_count               │
+  │  last_access    │        │  last_co                │
+  └─────────────────┘        └─────────────────────────┘
 
-  ┌─────────────────┐        ┌──────────────────┐
-  │  entity_access  │        │ co_occurrences   │
-  │                 │        │                  │
-  │  entity_id (PK  │        │ entity_a_id (PK  │
-  │    → entities)  │        │ entity_b_id (PK  │
-  │  access_count   │        │   → entities)    │
-  │  last_access    │        │ co_count         │
-  └─────────────────┘        │ last_co          │
-                             └──────────────────┘
+  ┌─────────────────────────┐
+  │    entity_access_log    │
+  │                         │
+  │  entity_id (PK → e)     │
+  │  access_date (PK)       │
+  │  access_count           │
+  └─────────────────────────┘
+
+  ┌─────────────────────────┐      ┌─────────────────────────┐
+  │       reflections       │      │   reflection_embeddings │
+  │                         │      │      (VIRTUAL vec0)     │
+  │  id (PK)                │      │                         │
+  │  target_type            │      │  embedding float[384]   │
+  │  target_id              │      └─────────────────────────┘
+  │  author                 │
+  │  content                │      ┌─────────────────────────┐
+  │  mood                   │      │     reflection_fts      │
+  │  created_at             │      │      (VIRTUAL FTS5)     │
+  └─────────────────────────┘      │  content, author, mood  │
+                                   └─────────────────────────┘
+
+  ┌─────────────────────────┐      ┌─────────────────────────┐
+  │      search_events      │──────│      search_results     │
+  │                         │ 1:N  │                         │
+  │  event_id (PK)          │      │  result_id (PK)         │
+  │  query_text             │      │  event_id (FK)          │
+  │  query_hash             │      │  entity_id              │
+  │  timestamp              │      │  entity_name            │
+  │  treatment              │      │  rank, limbic_score     │
+  │  k_limit                │      │  cosine_sim, importance │
+  │  num_results            │      │  temporal, cooc_boost   │
+  │  duration_ms            │      │  baseline_rank          │
+  │  engine_used            │      └─────────────────────────┘
+  └─────────────────────────┘                  │
+                                               │
+                                   ┌───────────┴───────────┐
+                                   │    implicit_feedback  │
+                                   │                       │
+                                   │  feedback_id (PK)     │
+                                   │  event_id  (FK)       │
+                                   │  entity_id            │
+                                   │  re_accessed          │
+                                   │  access_delta         │
+                                   │  session_id           │
+                                   └───────────────────────┘
 
   ┌─────────────────┐
   │  db_metadata    │  (independiente)
@@ -585,6 +655,7 @@ Tabla principal del knowledge graph. Cada fila representa un nodo con nombre ún
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Identificador interno único |
 | `name` | `TEXT` | `NOT NULL UNIQUE` | Nombre legible de la entidad. Clave de negocio — no pueden existir dos entidades con el mismo nombre |
 | `entity_type` | `TEXT` | `NOT NULL DEFAULT 'Generic'` | Clasificación de la entidad (ej. `Sesion`, `Componente`, `Sistema`) |
+| `status` | `TEXT` | `NOT NULL DEFAULT 'activo'` | Estado de la entidad (`activo` / `inactivo`). Usado para soft-delete lógico |
 | `created_at` | `TEXT` | `NOT NULL DEFAULT (datetime('now'))` | Marca temporal de creación en formato ISO-8601 |
 | `updated_at` | `TEXT` | `NOT NULL DEFAULT (datetime('now'))` | Marca temporal de última actualización |
 
@@ -597,6 +668,10 @@ Hechos o datos atados a una entidad. Una entidad puede tener cero o muchas obser
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Identificador interno único |
 | `entity_id` | `INTEGER` | `NOT NULL REFERENCES entities(id) ON DELETE CASCADE` | FK a la entidad padre. El cascade elimina observaciones cuando se borra la entidad |
 | `content` | `TEXT` | `NOT NULL` | Texto libre del hecho o dato observado |
+| `kind` | `TEXT` | `NOT NULL DEFAULT 'generic'` | Clasificación de la observación (`generic`, `technical`, `narrative`, etc.) |
+| `supersedes` | `INTEGER` | `NULL REFERENCES observations(id)` | FK a otra observación que esta reemplaza. Permite versionado de observaciones |
+| `superseded_at` | `TEXT` | `NULL` | Timestamp en que la observación fue marcada como reemplazada |
+| `similarity_flag` | `INTEGER` | `NOT NULL DEFAULT 0` | Flag interno para marcar observaciones potencialmente duplicadas (0 = no marcada, 1 = marcada) |
 | `created_at` | `TEXT` | `NOT NULL DEFAULT (datetime('now'))` | Marca temporal de creación |
 
 > **Nota**: `ON DELETE CASCADE` garantiza integridad referencial: eliminar una entidad elimina todas sus observaciones en cascada, sin huérfanos.
@@ -611,6 +686,9 @@ Aristas que conectan dos entidades con un tipo de relación semántica.
 | `from_entity` | `INTEGER` | `NOT NULL REFERENCES entities(id) ON DELETE CASCADE` | FK a la entidad de origen |
 | `to_entity` | `INTEGER` | `NOT NULL REFERENCES entities(id) ON DELETE CASCADE` | FK a la entidad de destino |
 | `relation_type` | `TEXT` | `NOT NULL` | Tipo de relación (ej. `uses`, `depends_on`, `part_of`) |
+| `context` | `TEXT` | `NULL` | Contexto semántico opcional de la relación |
+| `active` | `INTEGER` | `NOT NULL DEFAULT 1` | Estado de la relación (1 = activa, 0 = finalizada). Permite soft-delete con historial |
+| `ended_at` | `TEXT` | `NULL` | Timestamp en que la relación fue marcada como finalizada |
 | `created_at` | `TEXT` | `NOT NULL DEFAULT (datetime('now'))` | Marca temporal de creación |
 
 > **Nota**: La restricción `UNIQUE(from_entity, to_entity, relation_type)` impide duplicar relaciones idénticas entre las mismas dos entidades. No puede existir más de una relación del mismo tipo entre un par dado.
@@ -681,6 +759,100 @@ Tabla virtual FTS5 para búsqueda de texto completo. Indexa el nombre, tipo y ob
 
 > **Nota**: El tokenizer es `unicode61`, que soporta correctamente caracteres acentuados (é, ñ, ü) y otros Unicode. La sincronización es **code-level** (no triggers SQLite): `_sync_fts()` se invoca manualmente en `upsert_entity`, `add_observations` y `delete_observations`. En `init_db()`, si la tabla FTS está vacía pero hay entidades existentes, se ejecuta `_backfill_fts()` para poblarla.
 
+#### `entity_access_log`
+
+Log de acceso granular a nivel de día para cada entidad. Usado por el Sistema Límbico para calcular salience temporal.
+
+| Columna | Tipo | Restricciones | Descripción |
+|---|---|---|---|
+| `entity_id` | `INTEGER` | `NOT NULL REFERENCES entities(id) ON DELETE CASCADE` | FK a la entidad |
+| `access_date` | `TEXT` | `NOT NULL` | Fecha de acceso en formato ISO-8601 (día) |
+| `access_count` | `INTEGER` | `NOT NULL DEFAULT 1` | Número de accesos en esa fecha |
+| **PK** | `(entity_id, access_date)` | — | Clave primaria compuesta |
+
+#### `reflections`
+
+Reflexiones narrativas que añaden contexto humano sobre entidades, relaciones o sesiones.
+
+| Columna | Tipo | Restricciones | Descripción |
+|---|---|---|---|
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Identificador interno |
+| `target_type` | `TEXT` | `NOT NULL` | Tipo de objetivo: `entity`, `relation`, `session`, `global` |
+| `target_id` | `INTEGER` | `NULL` | ID del objetivo (nullable para `global`) |
+| `author` | `TEXT` | `NOT NULL` | Autor de la reflexión (`nolan` o `sofia`) |
+| `content` | `TEXT` | `NOT NULL` | Texto libre de la reflexión |
+| `mood` | `TEXT` | `NULL` | Estado de ánimo opcional (`frustracion`, `satisfaccion`, `curiosidad`, `duda`, `insight`) |
+| `created_at` | `TEXT` | `NOT NULL DEFAULT (datetime('now'))` | Timestamp de creación |
+
+#### `reflection_fts` (FTS5 Virtual)
+
+Tabla virtual FTS5 para búsqueda de texto completo sobre reflexiones.
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| `content` | `TEXT` | Contenido de la reflexión |
+| `author` | `TEXT` | Autor |
+| `mood` | `TEXT` | Estado de ánimo |
+| `rowid` | `INTEGER` (implícito) | Corresponde a `reflections.id` |
+
+#### `reflection_embeddings` (Virtual)
+
+Tabla virtual `vec0` para embeddings de reflexiones. Permite búsqueda semántica sobre el contenido reflexivo.
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| `embedding` | `float[384]` | Vector del embedding de la reflexión |
+| `rowid` | `INTEGER` (implícito) | Corresponde a `reflections.id` |
+
+#### `search_events`
+
+Registro de cada evento de búsqueda semántica ejecutado. Base del sistema A/B testing y análisis de calidad.
+
+| Columna | Tipo | Restricciones | Descripción |
+|---|---|---|---|
+| `event_id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | ID del evento |
+| `query_text` | `TEXT` | `NOT NULL` | Texto de la consulta |
+| `query_hash` | `TEXT` | `NOT NULL` | Hash del texto de consulta |
+| `timestamp` | `TEXT` | `NOT NULL DEFAULT (datetime('now'))` | Timestamp de la búsqueda |
+| `treatment` | `INTEGER` | `NOT NULL` | Grupo de tratamiento A/B (0 = control, 1 = experimental) |
+| `k_limit` | `INTEGER` | `NOT NULL` | Límite k usado en la búsqueda |
+| `num_results` | `INTEGER` | `NOT NULL` | Número de resultados retornados |
+| `duration_ms` | `REAL` | `NULL` | Duración de la búsqueda en milisegundos |
+| `engine_used` | `TEXT` | `NOT NULL` | Motor utilizado (`semantic`, `hybrid`, `fts_fallback`) |
+
+#### `search_results`
+
+Resultados individuales por evento de búsqueda. Almacena las métricas de ranking para análisis posterior.
+
+| Columna | Tipo | Restricciones | Descripción |
+|---|---|---|---|
+| `result_id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | ID del resultado |
+| `event_id` | `INTEGER` | `NOT NULL REFERENCES search_events(event_id)` | FK al evento de búsqueda |
+| `entity_id` | `INTEGER` | `NOT NULL` | ID de la entidad retornada |
+| `entity_name` | `TEXT` | `NOT NULL` | Nombre de la entidad (denormalizado) |
+| `rank` | `INTEGER` | `NOT NULL` | Posición final después de re-ranking |
+| `limbic_score` | `REAL` | `NULL` | Score del Sistema Límbico |
+| `cosine_sim` | `REAL` | `NULL` | Similitud coseno del embedding |
+| `importance` | `REAL` | `NULL` | Factor de importancia |
+| `temporal` | `REAL` | `NULL` | Factor temporal |
+| `cooc_boost` | `REAL` | `NULL` | Boost por co-ocurrencia |
+| `baseline_rank` | `INTEGER` | `NULL` | Posición antes del re-ranking |
+| **UNIQUE** | `(event_id, entity_id)` | — | Evita duplicados por evento |
+
+#### `implicit_feedback`
+
+Feedback implícito recolectado después de una búsqueda. Mide si el usuario re-accedió a una entidad retornada.
+
+| Columna | Tipo | Restricciones | Descripción |
+|---|---|---|---|
+| `feedback_id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | ID del feedback |
+| `event_id` | `INTEGER` | `NOT NULL REFERENCES search_events(event_id)` | FK al evento de búsqueda |
+| `entity_id` | `INTEGER` | `NOT NULL` | ID de la entidad |
+| `re_accessed` | `INTEGER` | `NOT NULL DEFAULT 0` | 1 si la entidad fue re-accedida, 0 si no |
+| `access_delta` | `INTEGER` | `NULL` | Tiempo en segundos entre búsqueda y re-acceso |
+| `session_id` | `TEXT` | `NULL` | ID de sesión opcional |
+| **FK** | `(event_id, entity_id)` | — | Referencia compuesta a `search_results(event_id, entity_id)` |
+
 ### Índices
 
 Los siguientes índices optimizan las consultas más frecuentes:
@@ -690,11 +862,17 @@ Los siguientes índices optimizan las consultas más frecuentes:
 | `idx_entities_name` | `entities` | `name` | Búsqueda rápida por nombre |
 | `idx_entities_type` | `entities` | `entity_type` | Filtrado por tipo de entidad |
 | `idx_obs_entity` | `observations` | `entity_id` | Recuperar observaciones de una entidad |
+| `idx_obs_entity_superseded` | `observations` | `entity_id, superseded_at` | Filtrar observaciones activas vs. reemplazadas por entidad |
 | `idx_rel_from` | `relations` | `from_entity` | Relaciones que parten de una entidad |
 | `idx_rel_to` | `relations` | `to_entity` | Relaciones que llegan a una entidad |
 | `idx_rel_type` | `relations` | `relation_type` | Filtrado por tipo de relación |
 | `idx_access_last` | `entity_access` | `last_access` | Ordenar por recencia de acceso |
 | `idx_cooc_b` | `co_occurrences` | `entity_b_id` | Lookup de co-ocurrencias por entidad B |
+| `idx_search_events_hash` | `search_events` | `query_hash` | Buscar eventos por hash de consulta |
+| `idx_search_events_time` | `search_events` | `timestamp` | Rango temporal de eventos |
+| `idx_search_results_event` | `search_results` | `event_id` | Resultados de un evento |
+| `idx_search_results_entity` | `search_results` | `entity_id` | Eventos donde aparece una entidad |
+| `idx_implicit_event` | `implicit_feedback` | `event_id` | Feedback de un evento de búsqueda |
 
 ### Schema SQL Completo
 
@@ -703,15 +881,20 @@ CREATE TABLE entities (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL UNIQUE,
     entity_type TEXT    NOT NULL DEFAULT 'Generic',
+    status      TEXT    NOT NULL DEFAULT 'activo',
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE observations (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_id  INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-    content    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id       INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    content         TEXT    NOT NULL,
+    kind            TEXT    NOT NULL DEFAULT 'generic',
+    supersedes      INTEGER NULL REFERENCES observations(id),
+    superseded_at   TEXT    NULL,
+    similarity_flag INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE relations (
@@ -719,6 +902,9 @@ CREATE TABLE relations (
     from_entity   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     to_entity     INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     relation_type TEXT    NOT NULL,
+    context       TEXT    NULL,
+    active        INTEGER NOT NULL DEFAULT 1,
+    ended_at      TEXT    NULL,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(from_entity, to_entity, relation_type)
 );
@@ -746,19 +932,89 @@ CREATE TABLE co_occurrences (
     PRIMARY KEY (entity_a_id, entity_b_id)
 );
 
+CREATE TABLE entity_access_log (
+    entity_id    INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    access_date  TEXT    NOT NULL,
+    access_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (entity_id, access_date)
+);
+
+-- A/B testing and search quality tables
+CREATE TABLE search_events (
+    event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_text   TEXT    NOT NULL,
+    query_hash   TEXT    NOT NULL,
+    timestamp    TEXT    NOT NULL DEFAULT (datetime('now')),
+    treatment    INTEGER NOT NULL,
+    k_limit      INTEGER NOT NULL,
+    num_results  INTEGER NOT NULL,
+    duration_ms  REAL,
+    engine_used  TEXT    NOT NULL
+);
+
+CREATE TABLE search_results (
+    result_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       INTEGER NOT NULL REFERENCES search_events(event_id),
+    entity_id      INTEGER NOT NULL,
+    entity_name    TEXT    NOT NULL,
+    rank           INTEGER NOT NULL,
+    limbic_score   REAL,
+    cosine_sim     REAL,
+    importance     REAL,
+    temporal       REAL,
+    cooc_boost     REAL,
+    baseline_rank  INTEGER,
+    UNIQUE(event_id, entity_id)
+);
+
+CREATE TABLE implicit_feedback (
+    feedback_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id      INTEGER NOT NULL REFERENCES search_events(event_id),
+    entity_id     INTEGER NOT NULL,
+    re_accessed   INTEGER NOT NULL DEFAULT 0,
+    access_delta  INTEGER,
+    session_id    TEXT,
+    FOREIGN KEY (event_id, entity_id) REFERENCES search_results(event_id, entity_id)
+);
+
+-- Reflections
+CREATE TABLE reflections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_type TEXT NOT NULL,
+    target_id   INTEGER,
+    author      TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    mood        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Full-text search (FTS5)
 CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
 USING fts5(name, entity_type, obs_text, tokenize="unicode61");
 
+CREATE VIRTUAL TABLE IF NOT EXISTS reflection_fts USING fts5(
+    content, author, mood, content='reflections', content_rowid='id'
+);
+
+-- Virtual tables for embeddings
+CREATE VIRTUAL TABLE IF NOT EXISTS reflection_embeddings
+USING vec0(embedding float[384]);
+
 -- Índices
-CREATE INDEX idx_entities_name  ON entities(name);
-CREATE INDEX idx_entities_type  ON entities(entity_type);
-CREATE INDEX idx_obs_entity     ON observations(entity_id);
-CREATE INDEX idx_rel_from       ON relations(from_entity);
-CREATE INDEX idx_rel_to         ON relations(to_entity);
-CREATE INDEX idx_rel_type       ON relations(relation_type);
-CREATE INDEX idx_access_last    ON entity_access(last_access);
-CREATE INDEX idx_cooc_b         ON co_occurrences(entity_b_id);
+CREATE INDEX idx_entities_name   ON entities(name);
+CREATE INDEX idx_entities_type   ON entities(entity_type);
+CREATE INDEX idx_obs_entity      ON observations(entity_id);
+CREATE INDEX idx_obs_entity_superseded ON observations(entity_id, superseded_at);
+CREATE INDEX idx_rel_from        ON relations(from_entity);
+CREATE INDEX idx_rel_to          ON relations(to_entity);
+CREATE INDEX idx_rel_type        ON relations(relation_type);
+CREATE INDEX idx_access_last     ON entity_access(last_access);
+CREATE INDEX idx_cooc_b          ON co_occurrences(entity_b_id);
+CREATE INDEX idx_search_events_hash   ON search_events(query_hash);
+CREATE INDEX idx_search_events_time   ON search_events(timestamp);
+CREATE INDEX idx_search_results_event ON search_results(event_id);
+CREATE INDEX idx_search_results_entity ON search_results(entity_id);
+CREATE INDEX idx_implicit_event        ON implicit_feedback(event_id);
 ```
 
 ---
@@ -772,7 +1028,7 @@ Los modelos Pydantic cumplen una función dual en MCP Memory v2:
 1. **Validación de inputs**: Cada MCP tool recibe datos del cliente (típicamente JSON). Los modelos validan que la estructura y los tipos sean correctos antes de tocar la base de datos.
 2. **Serialización de outputs**: Las respuestas de las tools se serializan a JSON de forma consistente y tipada, garantizando que el cliente reciba siempre la misma estructura.
 
-En total, las **10 MCP tools** usan estos modelos para validar y devolver datos sobre entidades y relaciones.
+En total, las **19 MCP tools** usan estos modelos para validar inputs. Los outputs se generan como dicts planos directamente desde el storage layer.
 
 ### `EntityInput`
 
@@ -793,31 +1049,12 @@ class EntityInput(BaseModel):
 
 > **Nota**: `observations` usa `default_factory=list` en vez de `default=[]` para evitar el bug clásico de mutable default arguments en Python.
 
-### `EntityOutput`
+### `RelationInput`
 
-Modelo de salida para entidades. Refleja la estructura que el cliente recibe como respuesta.
-
-```python
-class EntityOutput(BaseModel):
-    name: str
-    entityType: str
-    observations: list[str]
-```
-
-Todos los campos son obligatorios. No hay valores por defecto porque el servidor siempre los rellena desde la base de datos.
-
-### `RelationInput` / `RelationOutput`
-
-Ambos modelos comparten la misma estructura de campos. La diferencia está en el uso: `RelationInput` valida los datos que llega del cliente, `RelationOutput` serializa la respuesta.
+Modelo de entrada para crear o eliminar relaciones. Valida que los nombres de entidades no estén vacíos y maneja los aliases JSON requeridos por Anthropic.
 
 ```python
 class RelationInput(BaseModel):
-    from_entity: str = Field(..., alias="from")
-    to_entity: str   = Field(..., alias="to")
-    relationType: str
-    model_config = {"populate_by_name": True}
-
-class RelationOutput(BaseModel):
     from_entity: str = Field(..., alias="from")
     to_entity: str   = Field(..., alias="to")
     relationType: str
@@ -830,28 +1067,32 @@ class RelationOutput(BaseModel):
 | `to_entity` | `"to"` | `str` | Sí |
 | `relationType` | — | `str` | Sí |
 
-### Notas sobre Aliases
+> **Nota sobre aliases**: Los campos `from_entity` y `to_entity` usan aliases porque `from` y `to` son palabras reservadas de Python. `populate_by_name=True` permite aceptar tanto el nombre del atributo como el alias durante la deserialización, garantizando compatibilidad bidireccional con el formato de Anthropic MCP.
 
-Los campos `from_entity` y `to_entity` usan **aliases** en Pydantic por una razón técnica: `from` y `to` son **palabras reservadas de Python** (keywords), por lo que no pueden usarse como nombres de atributo en una clase.
+### Outputs: dicts planos
 
-Pydantic resuelve esto con `Field(..., alias="from")`:
+A diferencia de muchos servicios MCP, MCP Memory v2 **no usa modelos Pydantic de salida**. Las respuestas de las tools se construyen como `dict` planos directamente en el storage layer (`MemoryStore`) y se retornan tal cual. Esto evita overhead de serialización Pydantic en el path crítico y da flexibilidad para que cada tool devuelva la estructura exacta que necesita.
 
-- **En Python**: se accede como `relation.from_entity` (nombre legal)
-- **En JSON**: se serializa como `"from"` (formato esperado por Anthropic)
-
-La configuración `populate_by_name=True` permite que el modelo acepte tanto el nombre del atributo como el alias durante la deserialización:
+Ejemplo de output de `create_entities` (generado en Python puro, no por Pydantic):
 
 ```python
-# Ambas formas funcionan con populate_by_name=True:
-RelationInput(**{"from": "EntityA", "to": "EntityB", "relationType": "uses"})
-RelationInput(**{"from_entity": "EntityA", "to_entity": "EntityB", "relationType": "uses"})
+{
+    "entities": [
+        {
+            "name": "MCP Memory v2",
+            "entityType": "Sistema",
+            "observations": [
+                "Stack: FastMCP + SQLite-vec + ONNX embeddings",
+                "19 tools MCP: 8 Anthropic-compat + 11 nuevas"
+            ]
+        }
+    ]
+}
 ```
-
-Esto garantiza **compatibilidad bidireccional** con el formato de Anthropic MCP (que envía `"from"` / `"to"`) y con llamadas internas que usan los nombres Python.
 
 ### Código Fuente
 
-Archivo `models.py` — código íntegro:
+Archivo `models.py` — código íntegro (solo los 2 modelos Pydantic existentes):
 
 ```python
 from pydantic import BaseModel, Field
@@ -861,25 +1102,14 @@ class EntityInput(BaseModel):
     name: str = Field(..., min_length=1)
     entityType: str = Field(default="Generic")
     observations: list[str] = Field(default_factory=list)
-
-
-class EntityOutput(BaseModel):
-    name: str
-    entityType: str
-    observations: list[str]
+    status: str = Field(default="activo")
 
 
 class RelationInput(BaseModel):
     from_entity: str = Field(..., alias="from")
     to_entity: str = Field(..., alias="to")
     relationType: str
-    model_config = {"populate_by_name": True}
-
-
-class RelationOutput(BaseModel):
-    from_entity: str = Field(..., alias="from")
-    to_entity: str = Field(..., alias="to")
-    relationType: str
+    context: str | None = None
     model_config = {"populate_by_name": True}
 ```
 
@@ -887,7 +1117,7 @@ class RelationOutput(BaseModel):
 
 ## MCP Tools
 
-MCP Memory v2 expone 10 tools vía el protocolo MCP. Las primeras 8 son **100% compatibles** con el formato del servidor MCP Memory de Anthropic, lo que permite usarlo como drop-in replacement. Las 2 restantes son extensiones propias que añaden búsqueda semántica y migración desde el formato JSONL original.
+MCP Memory v2 expone 19 tools vía el protocolo MCP. Las primeras 8 son **100% compatibles** con el formato del servidor MCP Memory de Anthropic, lo que permite usarlo como drop-in replacement. Las 11 restantes son extensiones propias que añaden búsqueda semántica, migración, gestión de entidades, relaciones con historial y sistema de reflexiones.
 
 ### Tools compatibles con Anthropic (8)
 
@@ -910,6 +1140,7 @@ Cada dict dentro de `entities` se valida con el modelo `EntityInput` de Pydantic
 | `name` | `str` | Sí | — | Nombre de la entidad (mínimo 1 carácter). Actúa como identificador único. |
 | `entityType` | `str` | No | `"Generic"` | Tipo/categoría de la entidad (ej. `"Sesion"`, `"Componente"`, `"Tarea"`). |
 | `observations` | `list[str]` | No | `[]` | Lista de observaciones asociadas a la entidad. |
+| `status` | `str` | No | `"activo"` | Estado de la entidad (`activo` / `inactivo`). |
 
 **Respuesta**:
 
@@ -921,7 +1152,7 @@ Cada dict dentro de `entities` se valida con el modelo `EntityInput` de Pydantic
       "entityType": "Sistema",
       "observations": [
         "Stack: FastMCP + SQLite-vec + ONNX embeddings",
-        "10 tools MCP: 8 Anthropic-compat + 2 nuevos"
+        "19 tools MCP: 8 Anthropic-compat + 11 nuevas"
       ]
     }
   ]
@@ -962,6 +1193,7 @@ Cada dict dentro de `relations` se valida con el modelo `RelationInput` de Pydan
 | `from` | `str` | Sí | Nombre de la entidad origen. Debe existir en el grafo. |
 | `to` | `str` | Sí | Nombre de la entidad destino. Debe existir en el grafo. |
 | `relationType` | `str` | Sí | Tipo de relación (ej. `"contiene"`, `"depende_de"`, `"usa"`). |
+| `context` | `str` | No | Contexto semántico opcional de la relación. |
 
 **Respuesta** (todas creadas exitosamente):
 
@@ -1239,7 +1471,7 @@ Con errores:
       "name": "MCP Memory v2",
       "entityType": "Sistema",
       "observations": [
-        "10 tools MCP: 8 Anthropic-compat + 2 nuevos",
+        "19 tools MCP: 8 Anthropic-compat + 11 nuevas",
         "Ubicación: ~/.config/opencode/mcp-memory/"
       ]
     }
@@ -1256,7 +1488,7 @@ Con errores:
 
 #### 9. `search_semantic`
 
-**Descripción**: Semantic search using vector embeddings with optional full-text hybrid search. Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion, then applies limbic re-ranking based on access patterns and co-occurrence. Requires the embedding model to be downloaded (run `download_model.py` first).
+**Descripción**: Semantic search using vector embeddings with optional full-text hybrid search. Combines semantic (KNN) and text (FTS5) results via Reciprocal Rank Fusion, then applies limbic re-ranking based on access patterns and co-occurrence. Requires the embedding model to be available (auto-downloaded on first use; run `download_model.py` manually only if the host is offline).
 
 **Firma**: `search_semantic(query: str, limit: int = 10) → dict[str, Any]`
 
@@ -1276,7 +1508,7 @@ Con errores:
       "name": "MCP Memory v2",
       "entityType": "Sistema",
       "observations": [
-        "10 tools MCP: 8 Anthropic-compat + 2 nuevos",
+        "19 tools MCP: 8 Anthropic-compat + 11 nuevas",
         "Stack: FastMCP 3.1.1 + sqlite-vec + ONNX"
       ],
       "limbic_score": 0.6742,
@@ -1367,10 +1599,19 @@ Error (modelo no disponible):
 | `delete_entities` | 🗑️ Elimina | Eliminación manual antes del CASCADE (vec0 no lo soporta). |
 | `create_relations` | ❌ No | Las relaciones no participan en la búsqueda semántica. |
 | `delete_relations` | ❌ No | Ídem. |
+| `end_relation` | ❌ No | Solo actualiza el campo `active` y `ended_at` de la relación. |
 | `search_nodes` | ❌ No | Búsqueda LIKE, no requiere embeddings. |
 | `open_nodes` | ❌ No | Lectura directa por nombre exacto. |
 | `search_semantic` | 📖 Usa (lectura) | Codifica el query, busca por cosine distance, re-rankea con Limbic Scoring. Registra access + co-occurrences post-response. |
 | `migrate` | ✅ Sí (batch) | Genera embeddings para todas las entidades importadas al final. |
+| `find_duplicate_observations` | ❌ No | Análisis de similitud textual entre observaciones de una entidad. No genera embeddings. |
+| `consolidation_report` | ❌ No | Genera reporte de estado del grafo. No toca embeddings. |
+| `add_reflection` | ❌ No | Crea reflexión narrativa. No genera embeddings de entidades. |
+| `search_reflections` | ❌ No | Búsqueda semántica sobre reflexiones (usa `reflection_embeddings`, no `entity_embeddings`). |
+| `analyze_entity_split` | ❌ No | Análisis de si una entidad debe dividirse. No genera embeddings. |
+| `propose_entity_split_tool` | ❌ No | Propuesta de división de entidad. No genera embeddings. |
+| `execute_entity_split_tool` | ❌ No | Ejecuta división de entidad. No genera embeddings. |
+| `find_split_candidates` | ❌ No | Busca entidades candidatas a división. No genera embeddings. |
 
 ---
 
@@ -1385,23 +1626,23 @@ La pila técnica es:
 | Componente | Tecnología | Rol |
 |---|---|---|
 | Modelo de inferencia | ONNX Runtime (CPU) | Codifica texto → vector |
-| Modelo de lenguaje | intfloat/multilingual-e5-small | Sentence embeddings multilingüe (retrieval asimétrico) |
+| Modelo de lenguaje | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | Sentence embeddings multilingüe (384 dims, ONNX CPU) |
 | Tokenización | HuggingFace Tokenizers (Rust) | Tokenización rápida con padding/truncation |
 | Almacenamiento | sqlite-vec (vec0) | Búsqueda KNN con cosine distance |
 | Álgebra | NumPy float32 | Operaciones vectoriales |
 
 ### Modelo
 
-El modelo base es **`intfloat/multilingual-e5-small`** de [IntFloat](https://huggingface.co/intfloat) (familia E5):
+El modelo base es **`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`** de [sentence-transformers](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2):
 
 - **Dimensionalidad**: 384 floats (float32, ONNX FP32)
-- **Idiomas**: 94+ (multilingüe) — funciona nativamente con consultas en español, inglés y otros idiomas
+- **Idiomas**: 50+ (multilingüe) — funciona nativamente con consultas en español, inglés y otros idiomas
 - **Optimización**: diseñado para inferencia en CPU; no requiere GPU
 - **Tamaño ONNX**: ~465 MB (modelo exportado)
 - **Distancia**: cosine similarity (los vectores se normalizan L2)
-- **Tipo**: retrieval asimétrico — requiere prefijos `"query: "` y `"passage: "` según la tarea
+- **Tipo**: sentence embeddings multilingüe — no requiere prefijos de tarea
 
-El modelo se exporta a ONNX y se almacena localmente junto con los archivos del tokenizer. La exportación se realiza una vez mediante el script `scripts/download_model.py`.
+El modelo se exporta a ONNX y se almacena localmente junto con los archivos del tokenizer. La descarga es automática en el primer uso; `scripts/download_model.py` permanece como thin wrapper opcional.
 
 ### Arquitectura del Motor
 
@@ -1411,7 +1652,8 @@ Texto de entrada
        ▼
 ┌──────────────────┐
 │  Tokenizer (HF)  │  enable_truncation(max_length=512)
-│  fast tokenizer   │  enable_padding(length=512)
+│  fast tokenizer   │  Pass 1: no padding → compute max_len
+│                   │  Pass 2: enable_padding(length=max_len)
 └────────┬─────────┘
          │  input_ids, attention_mask
          ▼
@@ -1431,7 +1673,7 @@ Texto de entrada
 └────────┬─────────┘
          │
          ▼
-   float32[384]
+    float32[384]
 ```
 
 ### Pipeline de Encoding
@@ -1439,20 +1681,26 @@ Texto de entrada
 La clase `EmbeddingEngine.encode()` implementa el pipeline en cinco pasos:
 
 ```python
-def encode(self, texts: list[str], task: str = "passage") -> np.ndarray:
+def encode(self, texts: list[str], *, task: str = "passage") -> np.ndarray:
     """Encode texts to embeddings.
-    task: "query" prepends "query: " prefix, "passage" prepends "passage: ".
+    The ``task`` parameter is kept for API compatibility but is not used
+    by the current MiniLM-based model.
     """
-    prefix = self.QUERY_PREFIX if task == "query" else self.PASSAGE_PREFIX
-    prefixed = [f"{prefix}{t}" for t in texts]
     # ... tokenization → ONNX → mean pooling → L2 normalize
 ```
 
-Los prefijos `"query: "` y `"passage: "` son un **requisito del modelo e5** para retrieval asimétrico. Las consultas de `search_semantic` usan `task="query"`, mientras que las entidades se codifican con `task="passage"` (default).
+El parámetro `task` se mantiene por compatibilidad de API pero es un **no-op** en el modelo actual. No se aplican prefijos de ningún tipo.
 
 #### Paso 1 — Tokenización
 
 ```python
+# First pass: find max length without padding
+self._tokenizer.no_padding()
+encoded_raw = self._tokenizer.encode_batch(texts)
+max_len = max(len(e.ids) for e in encoded_raw)
+
+# Second pass: pad to the actual max length of this batch
+self._tokenizer.enable_padding(length=max_len)
 encoded = self._tokenizer.encode_batch(texts)
 
 input_ids = np.array(
@@ -1465,10 +1713,13 @@ attention_mask = np.array(
 )
 ```
 
-Se usa el **HuggingFace fast tokenizer** (implementación en Rust) con dos configuraciones fijas:
+Se usa el **HuggingFace fast tokenizer** (implementación en Rust) con **padding dinámico**:
 
 - `enable_truncation(max_length=512)`: trunca secuencias más largas a 512 tokens
-- `enable_padding(length=512)`: rellena secuencias más cortas con `[PAD]` hasta 512 tokens
+- **Pass 1** (`no_padding`): tokeniza sin relleno para calcular la longitud real máxima del batch
+- **Pass 2** (`enable_padding(length=max_len)`): rellena secuencias más cortas con `[PAD]` hasta `max_len` del batch actual
+
+El padding dinámico evita computación desperdiciada en textos cortos (speedup 8–50× respecto a padding fijo a 512).
 
 #### Paso 2 — Forward ONNX
 
@@ -1622,7 +1873,7 @@ Si los archivos del modelo (`model.onnx` + `tokenizer.json`) no están presentes
 query (texto libre)
   │
   ▼
-engine.encode([query], task="query") → float32[384] (L2-normalizado)
+engine.encode([query]) → float32[384] (L2-normalizado)
   │
   ▼
 serialize_f32(vector)           → 1536 bytes
@@ -1655,9 +1906,9 @@ La búsqueda KNN pura por embeddings encuentra entidades semánticamente similar
                     ▼                     ▼
         ┌──────────────────┐  ┌──────────────────┐
         │  Semantic (KNN)  │  │  Full-text (FTS5)│
-        │  encode(query,   │  │  BM25 sobre      │
-        │   task="query")  │  │  name/type/obs   │
-        │  → KNN 3× limit  │  │  → top 3× limit  │
+        │  encode(query)   │  │  BM25 sobre      │
+        │  → KNN 3× limit  │  │  name/type/obs   │
+        │                  │  │  → top 3× limit  │
         └────────┬─────────┘  └────────┬─────────┘
                  │ [{entity_id,       │ [{entity_id,
                  │   distance}]       │   rank}]
@@ -1875,7 +2126,7 @@ CREATE TABLE co_occurrences (
 ### Flujo completo: encode → re-rank → track
 
 ```
-1. Encode query     → engine.encode([query], task="query") → float[384]
+1. Encode query     → engine.encode([query]) → float[384]
 2. KNN 3×           → search_embeddings(query, limit × 3) → [{entity_id, distance}]
 3. Fetch metadata   → get_access_data(), get_entity_degrees(), get_co_occurrences()
 4. Re-rank          → rank_candidates() → compute limbic_score per candidate → sort → top-K
@@ -2080,3 +2331,30 @@ Cada vez que las observaciones de una entidad cambian, el embedding se **regener
 - **Consistencia**: el embedding siempre refleja el estado actual, sin artefactos de actualizaciones parciales
 - **Costo**: cada actualización dispara una codificación ONNX completa (~5ms en CPU para un vector individual)
 - **Sobrescritura**: `INSERT OR REPLACE` en vec0 asegura que no se acumulan versiones antiguas
+
+### Límites de entrada (input limits)
+
+Las siguientes constantes en `config.py` acotan el tamaño de las peticiones para prevenir abuso y garantizar latencias predecibles:
+
+| Constante | Valor | Afecta a |
+|---|---|---|
+| `MAX_OBSERVATIONS_PER_CALL` | `100` | Máximo de observaciones por llamada a `create_entities` o `add_observations` |
+| `MAX_ENTITIES_PER_CALL` | `50` | Máximo de entidades por llamada a `create_entities` |
+| `MAX_OBSERVATION_LENGTH` | `2000` | Longitud máxima (caracteres) de una observación individual |
+| `MAX_QUERY_LENGTH` | `500` | Longitud máxima (caracteres) del parámetro `query` en `search_semantic` y `search_nodes` |
+
+Las validaciones ocurren a nivel de Pydantic (`Field(..., max_length=...)`) y de código antes de tocar la base de datos. Si se excede un límite, el servidor responde con un error de validación descriptivo.
+
+### Shadow mode A/B testing
+
+El Sistema Límbico incluye un mecanismo de **shadow A/B testing** controlado por `config.py`:
+
+```python
+USE_AB_TESTING = True
+BASELINE_PROBABILITY = 0.1  # 10% baseline, 90% limbic
+```
+
+- **Baseline (10%)**: las consultas se ranquean únicamente por distancia coseno (`rank_candidates()` sin limbic scoring). Sirve como control para medir el lift del sistema límbico.
+- **Treatment (90%)**: las consultas usan el scoring límbico completo (`rank_hybrid_candidates()` o `rank_candidates()` con limbic).
+
+La asignación es probabilística por consulta. Los resultados de ambas ramas se registran internamente (cuando las tablas de métricas están habilitadas) para calcular métricas como Precision@K, MRR@K y NDCG@K offline. Para tuning de hiperparámetros (`GAMMA`, `BETA_SAL`) existe `scripts/auto_tuner.py`.
