@@ -607,3 +607,70 @@ class TestAddObservationsBatch:
         obs = store.get_observations(eid)
         assert obs.count("dup") == 1
 
+
+class TestAutoCommit:
+    def test_upsert_entity_auto_commit_false_no_commit(self):
+        store = MemoryStore(":memory:")
+        store.init_db()
+        store.db.execute("BEGIN IMMEDIATE")
+        store.upsert_entity("Test", "Type", auto_commit=False)
+        count = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        assert count == 1
+        store.db.rollback()
+        count = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        assert count == 0
+
+    def test_add_observations_auto_commit_false_no_commit(self):
+        store = MemoryStore(":memory:")
+        store.init_db()
+        eid = store.upsert_entity("Test", "Type")
+        store.db.execute("BEGIN IMMEDIATE")
+        store.add_observations(eid, ["obs1"], auto_commit=False)
+        count = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        assert count == 1
+        store.db.rollback()
+        count = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        assert count == 0
+
+    def test_delete_observations_auto_commit_false_no_commit(self):
+        store = MemoryStore(":memory:")
+        store.init_db()
+        eid = store.upsert_entity("Test", "Type")
+        store.add_observations(eid, ["obs1", "obs2"])
+        store.db.execute("BEGIN IMMEDIATE")
+        store.delete_observations(eid, ["obs1"], auto_commit=False)
+        count = store.db.execute(
+            "SELECT COUNT(*) FROM observations WHERE content = 'obs1'"
+        ).fetchone()[0]
+        assert count == 0
+        store.db.rollback()
+        count = store.db.execute(
+            "SELECT COUNT(*) FROM observations WHERE content = 'obs1'"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_create_relation_auto_commit_false_no_commit(self):
+        store = MemoryStore(":memory:")
+        store.init_db()
+        e1 = store.upsert_entity("A", "Type")
+        e2 = store.upsert_entity("B", "Type")
+        store.db.execute("BEGIN IMMEDIATE")
+        store.create_relation(e1, e2, "relaciona", auto_commit=False)
+        count = store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+        assert count == 1
+        store.db.rollback()
+        count = store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+        assert count == 0
+
+    def test_crud_defaults_auto_commit_true(self):
+        store = MemoryStore(":memory:")
+        store.init_db()
+        eid = store.upsert_entity("Test", "Type")
+        assert store.get_entity_by_name("Test") is not None
+        store.add_observations(eid, ["obs1"])
+        assert store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        store.create_relation(eid, eid, "self")
+        assert store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0] == 1
+        store.delete_observations(eid, ["obs1"])
+        assert store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+

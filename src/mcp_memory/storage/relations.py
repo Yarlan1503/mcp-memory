@@ -19,6 +19,8 @@ class RelationsMixin:
         to_entity_id: int,
         relation_type: str,
         context: str | None = None,
+        *,
+        auto_commit: bool = True,
     ) -> bool:
         """INSERT relation. ON CONFLICT -> return False (already exists).
         If relation_type has an inverse, automatically creates the inverse relation."""
@@ -30,10 +32,12 @@ class RelationsMixin:
                 """,
                 (from_entity_id, to_entity_id, relation_type, context),
             )
-            self.db.commit()
+            if auto_commit:
+                self.db.commit()
             # Auto-create inverse relation (best-effort)
             self._ensure_inverse_relation(
-                from_entity_id, to_entity_id, relation_type, context
+                from_entity_id, to_entity_id, relation_type, context,
+                auto_commit=auto_commit,
             )
             return True
         except sqlite3.IntegrityError:
@@ -47,6 +51,8 @@ class RelationsMixin:
         to_id: int,
         relation_type: str,
         context: str | None = None,
+        *,
+        auto_commit: bool = True,
     ) -> None:
         """Auto-create the inverse relation if one is defined in INVERSE_RELATIONS.
         Best-effort: silently skips if inverse already exists or type has no inverse."""
@@ -70,7 +76,8 @@ class RelationsMixin:
                 "INSERT INTO relations (from_entity, to_entity, relation_type, context) VALUES (?, ?, ?, ?)",
                 (to_id, from_id, inverse_type, inverse_context),
             )
-            self.db.commit()
+            if auto_commit:
+                self.db.commit()
         except sqlite3.IntegrityError:
             # Race condition or already exists — ignore
             pass

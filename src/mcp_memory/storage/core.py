@@ -16,7 +16,7 @@ class CoreMixin:
     # ------------------------------------------------------------------
 
     @retry_on_locked
-    def upsert_entity(self, name: str, entity_type: str, status: str = "activo") -> int:
+    def upsert_entity(self, name: str, entity_type: str, status: str = "activo", *, auto_commit: bool = True) -> int:
         """INSERT or UPDATE entity. Returns entity_id. Updates updated_at."""
         self.db.execute(
             """
@@ -29,12 +29,14 @@ class CoreMixin:
             """,
             (name, entity_type, status),
         )
-        self.db.commit()
+        if auto_commit:
+            self.db.commit()
         row = self.db.execute(
             "SELECT id FROM entities WHERE name = ?", (name,)
         ).fetchone()
         entity_id = row["id"]  # type: ignore[return-value]
-        self._sync_fts(entity_id)
+        if auto_commit:
+            self._sync_fts(entity_id)
         return entity_id
 
     def get_entity_by_name(self, name: str) -> dict | None:
@@ -172,6 +174,8 @@ class CoreMixin:
         observations: list[str],
         kind: str = "generic",
         supersedes: int | None = None,
+        *,
+        auto_commit: bool = True,
     ) -> int:
         """INSERT multiple observations. Returns count inserted.
         Skips duplicates (same content for same entity).
@@ -190,10 +194,11 @@ class CoreMixin:
 
         # Acquire write lock early to prevent contention during ONNX inference
         # Skip if already in a transaction (e.g., called from execute_entity_split)
-        try:
-            self.db.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
-            pass  # Already in a transaction — use existing lock
+        if auto_commit:
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                pass  # Already in a transaction — use existing lock
 
         # --- Handle supersedes logic ---
         if supersedes is not None:
@@ -322,8 +327,9 @@ class CoreMixin:
                 )
 
         if inserted:
-            self.db.commit()
-            self._sync_fts(entity_id)
+            if auto_commit:
+                self.db.commit()
+                self._sync_fts(entity_id)
         return inserted
 
     def get_observations(
@@ -464,7 +470,7 @@ class CoreMixin:
         return {r["id"]: dict(r) for r in rows}
 
     @retry_on_locked
-    def delete_observations(self, entity_id: int, observations: list[str]) -> int:
+    def delete_observations(self, entity_id: int, observations: list[str], *, auto_commit: bool = True) -> int:
         """DELETE by exact content match. Returns count deleted."""
         if not observations:
             return 0
@@ -473,6 +479,7 @@ class CoreMixin:
             f"DELETE FROM observations WHERE entity_id = ? AND content IN ({placeholders})",
             [entity_id, *observations],
         )
-        self.db.commit()
-        self._sync_fts(entity_id)
+        if auto_commit:
+            self.db.commit()
+            self._sync_fts(entity_id)
         return cursor.rowcount

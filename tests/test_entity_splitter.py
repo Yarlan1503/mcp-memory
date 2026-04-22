@@ -701,10 +701,6 @@ class TestSemanticIntegration:
         assert result["needs_split"] is True
 
 
-@pytest.mark.xfail(
-    reason="CRUD methods commit internally; SQLite savepoints cannot roll back committed work. Needs auto_commit=False flag in store methods.",
-    strict=False,
-)
 def test_entity_split_rollback_on_failure(store_with_schema, monkeypatch):
     """Split failure mid-loop should leave DB in original state (atomic)."""
     store = store_with_schema
@@ -715,6 +711,7 @@ def test_entity_split_rollback_on_failure(store_with_schema, monkeypatch):
     # 2. Count before
     entities_before = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     obs_before = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    relations_before = store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
 
     # 3. Approved splits: 2 splits, will fail during second iteration
     approved_splits = [
@@ -726,12 +723,12 @@ def test_entity_split_rollback_on_failure(store_with_schema, monkeypatch):
     call_count = 0
     original_create_relation = store.create_relation
 
-    def _failing_create_relation(from_id, to_id, rel_type, context=None):
+    def _failing_create_relation(from_id, to_id, rel_type, context=None, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count > 2:  # fail during second split
             raise RuntimeError("simulated failure mid-split")
-        return original_create_relation(from_id, to_id, rel_type, context)
+        return original_create_relation(from_id, to_id, rel_type, context, **kwargs)
 
     monkeypatch.setattr(store, "create_relation", _failing_create_relation)
 
@@ -742,5 +739,51 @@ def test_entity_split_rollback_on_failure(store_with_schema, monkeypatch):
     # 5. Verify counts rolled back
     entities_after = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     obs_after = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    relations_after = store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
     assert entities_after == entities_before
     assert obs_after == obs_before
+    assert relations_after == relations_before
+
+
+def test_entity_split_rollback_on_add_observations_failure(store_with_schema, monkeypatch):
+    """Split failure during add_observations should leave DB in original state (atomic)."""
+    store = store_with_schema
+    # 1. Create original entity with 3 obs
+    eid = store.upsert_entity("Original", "Type")
+    store.add_observations(eid, ["obs1", "obs2", "obs3"])
+
+    # 2. Count before
+    entities_before = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    obs_before = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    relations_before = store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+
+    # 3. Approved splits: 2 splits, will fail during second split
+    approved_splits = [
+        {"name": "SplitA", "entity_type": "Type", "observations": ["obs1"]},
+        {"name": "SplitB", "entity_type": "Type", "observations": ["obs2"]},
+    ]
+
+    # Make add_observations raise during the second split
+    call_count = 0
+    original_add_obs = store.add_observations
+
+    def _failing_add_obs(entity_id, observations, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:  # fail during second split
+            raise RuntimeError("simulated add_obs failure")
+        return original_add_obs(entity_id, observations, **kwargs)
+
+    monkeypatch.setattr(store, "add_observations", _failing_add_obs)
+
+    # 4. Execute — must raise
+    with pytest.raises(RuntimeError, match="simulated add_obs failure"):
+        execute_entity_split(store, "Original", approved_splits)
+
+    # 5. Verify counts rolled back
+    entities_after = store.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    obs_after = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    relations_after = store.db.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+    assert entities_after == entities_before
+    assert obs_after == obs_before
+    assert relations_after == relations_before

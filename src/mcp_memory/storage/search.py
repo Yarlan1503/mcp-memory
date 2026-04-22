@@ -75,7 +75,7 @@ class SearchMixin:
         return " | ".join(obs_parts)
 
     @retry_on_locked
-    def _sync_fts(self, entity_id: int) -> None:
+    def _sync_fts(self, entity_id: int, *, auto_commit: bool = True) -> None:
         """Rebuild FTS index entry for an entity from current DB state.
         Idempotent: INSERT OR REPLACE. No-op if FTS not available."""
         if not self._fts_available:
@@ -92,7 +92,8 @@ class SearchMixin:
                 "INSERT OR REPLACE INTO entity_fts(rowid, name, entity_type, obs_text) VALUES (?, ?, ?, ?)",
                 (entity_id, entity["name"], entity["entity_type"], obs_text),
             )
-            self.db.commit()
+            if auto_commit:
+                self.db.commit()
         except Exception as exc:
             logger.warning("FTS sync failed for entity %s: %s", entity_id, exc)
 

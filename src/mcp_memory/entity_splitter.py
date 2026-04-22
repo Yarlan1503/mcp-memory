@@ -899,14 +899,7 @@ def execute_entity_split(
     new_entity_ids: list[int] = []
     observations_moved = 0
 
-    # NOTE: The CRUD methods called below (upsert_entity, add_observations,
-    # create_relation, delete_observations) perform internal commits. SQLite
-    # savepoints cannot roll back changes that have already been committed by
-    # those methods. For true atomicity the store would need an auto_commit=False
-    # flag (or similar) so that the split transaction controls all commits.
-    # Until then this savepoint provides best-effort containment for failures
-    # that happen between the explicit commits inside the loop.
-    store.db.execute("SAVEPOINT split")
+    store.db.execute("BEGIN IMMEDIATE")
     try:
         # Create new entities and add observations
         for split in approved_splits:
@@ -915,12 +908,14 @@ def execute_entity_split(
             split_obs = split["observations"]
 
             # Upsert the new entity
-            new_id = store.upsert_entity(split_name, split_type)
+            new_id = store.upsert_entity(split_name, split_type, auto_commit=False)
             new_entity_ids.append(new_id)
 
             # Add observations to new entity
             if split_obs:
-                inserted = store.add_observations(new_id, split_obs)
+                inserted = store.add_observations(
+                    new_id, split_obs, auto_commit=False
+                )
                 observations_moved += inserted
                 logger.debug(
                     "Created entity '%s' (id=%d) with %d observations",
@@ -930,8 +925,12 @@ def execute_entity_split(
                 )
 
             # Create relations: parent contiene child, child parte_de parent
-            store.create_relation(original_id, new_id, "contiene")
-            store.create_relation(new_id, original_id, "parte_de")
+            store.create_relation(
+                original_id, new_id, "contiene", auto_commit=False
+            )
+            store.create_relation(
+                new_id, original_id, "parte_de", auto_commit=False
+            )
             logger.debug(
                 "Created contains/parte_de relations: %s <-> %s",
                 parent,
@@ -940,26 +939,23 @@ def execute_entity_split(
 
         # Remove moved observations from original entity
         if all_moved_obs:
-            deleted = store.delete_observations(original_id, list(all_moved_obs))
+            deleted = store.delete_observations(
+                original_id, list(all_moved_obs), auto_commit=False
+            )
             logger.debug(
                 "Removed %d observations from original entity '%s'",
                 deleted,
                 entity_name,
             )
-        try:
-            store.db.execute("RELEASE SAVEPOINT split")
-        except sqlite3.OperationalError:
-            # Savepoint was consumed by internal commits from CRUD methods.
-            pass
+
+        store.db.execute("COMMIT")
     except Exception:
-        try:
-            store.db.execute("ROLLBACK TO SAVEPOINT split")
-            store.db.execute("RELEASE SAVEPOINT split")
-        except sqlite3.OperationalError:
-            # Savepoint was consumed by an internal commit from a CRUD method;
-            # rollback is no longer possible. This is a known limitation.
-            pass
+        store.db.execute("ROLLBACK")
         raise
+
+    # Sync FTS for all affected entities (best-effort, post-commit)
+    for eid in new_entity_ids + [original_id]:
+        store._sync_fts(eid, auto_commit=True)
 
     # Get remaining observations in original entity
     remaining_obs = store.get_observations(original_id)
