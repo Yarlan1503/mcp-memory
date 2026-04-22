@@ -2,6 +2,7 @@
 
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 from mcp_memory.retry import retry_on_locked
@@ -58,6 +59,7 @@ class MemoryStore(
             resolved = Path(db_path).expanduser().resolve()
             resolved.parent.mkdir(parents=True, exist_ok=True)
             self.db = sqlite3.connect(str(resolved), check_same_thread=False)
+        self._write_lock = threading.RLock()
         self.db.row_factory = sqlite3.Row
 
         # --- PRAGMAs (before any table creation) ---
@@ -127,8 +129,9 @@ class MemoryStore(
     @retry_on_locked
     def set_metadata(self, key: str, value: str) -> None:
         """Set metadata value (INSERT OR REPLACE)."""
-        self.db.execute(
-            "INSERT OR REPLACE INTO db_metadata (key, value) VALUES (?, ?)",
-            (key, value),
-        )
-        self.db.commit()
+        with self._write_lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO db_metadata (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+            self.db.commit()

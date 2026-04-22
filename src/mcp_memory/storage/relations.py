@@ -24,25 +24,26 @@ class RelationsMixin:
     ) -> bool:
         """INSERT relation. ON CONFLICT -> return False (already exists).
         If relation_type has an inverse, automatically creates the inverse relation."""
-        try:
-            self.db.execute(
-                """
-                INSERT INTO relations (from_entity, to_entity, relation_type, context)
-                VALUES (?, ?, ?, ?);
-                """,
-                (from_entity_id, to_entity_id, relation_type, context),
-            )
-            if auto_commit:
-                self.db.commit()
-            # Auto-create inverse relation (best-effort)
-            self._ensure_inverse_relation(
-                from_entity_id, to_entity_id, relation_type, context,
-                auto_commit=auto_commit,
-            )
-            return True
-        except sqlite3.IntegrityError:
-            # UNIQUE constraint violated -> already exists
-            return False
+        with self._write_lock:
+            try:
+                self.db.execute(
+                    """
+                    INSERT INTO relations (from_entity, to_entity, relation_type, context)
+                    VALUES (?, ?, ?, ?);
+                    """,
+                    (from_entity_id, to_entity_id, relation_type, context),
+                )
+                if auto_commit:
+                    self.db.commit()
+                # Auto-create inverse relation (best-effort)
+                self._ensure_inverse_relation(
+                    from_entity_id, to_entity_id, relation_type, context,
+                    auto_commit=auto_commit,
+                )
+                return True
+            except sqlite3.IntegrityError:
+                # UNIQUE constraint violated -> already exists
+                return False
 
     @retry_on_locked
     def _ensure_inverse_relation(
@@ -56,42 +57,44 @@ class RelationsMixin:
     ) -> None:
         """Auto-create the inverse relation if one is defined in INVERSE_RELATIONS.
         Best-effort: silently skips if inverse already exists or type has no inverse."""
-        inverse_type = INVERSE_RELATIONS.get(relation_type)
-        if inverse_type is None:
-            return
-
-        # Build context for the inverse
-        inverse_context = f"Inversa automática de {relation_type}"
-
-        try:
-            # Check if inverse already exists to avoid IntegrityError noise
-            existing = self.db.execute(
-                "SELECT 1 FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
-                (to_id, from_id, inverse_type),
-            ).fetchone()
-            if existing:
+        with self._write_lock:
+            inverse_type = INVERSE_RELATIONS.get(relation_type)
+            if inverse_type is None:
                 return
 
-            self.db.execute(
-                "INSERT INTO relations (from_entity, to_entity, relation_type, context) VALUES (?, ?, ?, ?)",
-                (to_id, from_id, inverse_type, inverse_context),
-            )
-            if auto_commit:
-                self.db.commit()
-        except sqlite3.IntegrityError:
-            # Race condition or already exists — ignore
-            pass
+            # Build context for the inverse
+            inverse_context = f"Inversa automática de {relation_type}"
+
+            try:
+                # Check if inverse already exists to avoid IntegrityError noise
+                existing = self.db.execute(
+                    "SELECT 1 FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
+                    (to_id, from_id, inverse_type),
+                ).fetchone()
+                if existing:
+                    return
+
+                self.db.execute(
+                    "INSERT INTO relations (from_entity, to_entity, relation_type, context) VALUES (?, ?, ?, ?)",
+                    (to_id, from_id, inverse_type, inverse_context),
+                )
+                if auto_commit:
+                    self.db.commit()
+            except sqlite3.IntegrityError:
+                # Race condition or already exists — ignore
+                pass
 
     @retry_on_locked
     def _end_relation(self, relation_id: int) -> bool:
         """Deactivate a relation by setting active=0 and ended_at.
         Returns True if the relation was found and updated, False otherwise."""
-        cursor = self.db.execute(
-            "UPDATE relations SET active = 0, ended_at = datetime('now') WHERE id = ?",
-            (relation_id,),
-        )
-        self.db.commit()
-        return cursor.rowcount > 0
+        with self._write_lock:
+            cursor = self.db.execute(
+                "UPDATE relations SET active = 0, ended_at = datetime('now') WHERE id = ?",
+                (relation_id,),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
 
     def get_relation_by_id(self, relation_id: int) -> dict | None:
         """Get a single relation by its ID. Returns dict or None."""
@@ -109,15 +112,16 @@ class RelationsMixin:
         self, from_entity_id: int, to_entity_id: int, relation_type: str
     ) -> bool:
         """DELETE relation. Returns True if it existed."""
-        cursor = self.db.execute(
-            """
-            DELETE FROM relations
-            WHERE from_entity = ? AND to_entity = ? AND relation_type = ?;
-            """,
-            (from_entity_id, to_entity_id, relation_type),
-        )
-        self.db.commit()
-        return cursor.rowcount > 0
+        with self._write_lock:
+            cursor = self.db.execute(
+                """
+                DELETE FROM relations
+                WHERE from_entity = ? AND to_entity = ? AND relation_type = ?;
+                """,
+                (from_entity_id, to_entity_id, relation_type),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
 
     def get_all_relations(self) -> list[dict]:
         """All relations with entity names (JOIN).

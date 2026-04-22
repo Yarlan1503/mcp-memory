@@ -31,75 +31,76 @@ class ReflectionsMixin:
         If target_type is 'global', target_id must be None.
         Generates embedding and syncs FTS.
         """
-        # Validations
-        if target_type not in VALID_TARGET_TYPES:
-            logger.warning("Invalid target_type: %s", target_type)
-            return None
-        if author not in VALID_AUTHORS:
-            logger.warning("Invalid author: %s", author)
-            return None
-        if mood is not None and mood not in VALID_MOODS:
-            logger.warning("Invalid mood: %s", mood)
-            return None
-        if target_type in ("entity", "relation") and target_id is None:
-            logger.warning("target_id required for target_type '%s'", target_type)
-            return None
-        if target_type == "global" and target_id is not None:
-            logger.warning("target_id must be None for global reflections")
-            return None
+        with self._write_lock:
+            # Validations
+            if target_type not in VALID_TARGET_TYPES:
+                logger.warning("Invalid target_type: %s", target_type)
+                return None
+            if author not in VALID_AUTHORS:
+                logger.warning("Invalid author: %s", author)
+                return None
+            if mood is not None and mood not in VALID_MOODS:
+                logger.warning("Invalid mood: %s", mood)
+                return None
+            if target_type in ("entity", "relation") and target_id is None:
+                logger.warning("target_id required for target_type '%s'", target_type)
+                return None
+            if target_type == "global" and target_id is not None:
+                logger.warning("target_id must be None for global reflections")
+                return None
 
-        # Insert reflection
-        cursor = self.db.execute(
-            "INSERT INTO reflections (target_type, target_id, author, content, mood) VALUES (?, ?, ?, ?, ?)",
-            (target_type, target_id, author, content, mood),
-        )
-        self.db.commit()
-        reflection_id = cursor.lastrowid
+            # Insert reflection
+            cursor = self.db.execute(
+                "INSERT INTO reflections (target_type, target_id, author, content, mood) VALUES (?, ?, ?, ?, ?)",
+                (target_type, target_id, author, content, mood),
+            )
+            self.db.commit()
+            reflection_id = cursor.lastrowid
 
-        # Sync FTS (manual content sync)
-        if self._fts_available:
-            try:
-                self.db.execute(
-                    "INSERT INTO reflection_fts(rowid, content, author, mood) VALUES (?, ?, ?, ?)",
-                    (reflection_id, content, author, mood or ""),
-                )
-                self.db.commit()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to sync reflection FTS for id %s: %s", reflection_id, exc
-                )
+            # Sync FTS (manual content sync)
+            if self._fts_available:
+                try:
+                    self.db.execute(
+                        "INSERT INTO reflection_fts(rowid, content, author, mood) VALUES (?, ?, ?, ?)",
+                        (reflection_id, content, author, mood or ""),
+                    )
+                    self.db.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to sync reflection FTS for id %s: %s", reflection_id, exc
+                    )
 
-        # Generate embedding
-        engine = self._get_embedding_engine()
-        if engine and engine.available:
-            try:
-                from mcp_memory.embeddings import serialize_f32
+            # Generate embedding
+            engine = self._get_embedding_engine()
+            if engine and engine.available:
+                try:
+                    from mcp_memory.embeddings import serialize_f32
 
-                vector = engine.encode([content])
-                embedding_bytes = serialize_f32(vector[0])
-                self.db.execute(
-                    "INSERT INTO reflection_embeddings(rowid, embedding) VALUES (?, ?)",
-                    (reflection_id, embedding_bytes),
-                )
-                self.db.commit()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to store reflection embedding for id %s: %s",
-                    reflection_id,
-                    exc,
-                )
+                    vector = engine.encode([content])
+                    embedding_bytes = serialize_f32(vector[0])
+                    self.db.execute(
+                        "INSERT INTO reflection_embeddings(rowid, embedding) VALUES (?, ?)",
+                        (reflection_id, embedding_bytes),
+                    )
+                    self.db.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to store reflection embedding for id %s: %s",
+                        reflection_id,
+                        exc,
+                    )
 
-        return {
-            "id": reflection_id,
-            "target_type": target_type,
-            "target_id": target_id,
-            "author": author,
-            "content": content,
-            "mood": mood,
-            "created_at": self.db.execute(
-                "SELECT created_at FROM reflections WHERE id = ?", (reflection_id,)
-            ).fetchone()["created_at"],
-        }
+            return {
+                "id": reflection_id,
+                "target_type": target_type,
+                "target_id": target_id,
+                "author": author,
+                "content": content,
+                "mood": mood,
+                "created_at": self.db.execute(
+                    "SELECT created_at FROM reflections WHERE id = ?", (reflection_id,)
+                ).fetchone()["created_at"],
+            }
 
     def get_reflections_for_target(
         self, target_type: str, target_id: int | None = None

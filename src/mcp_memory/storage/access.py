@@ -19,11 +19,12 @@ class AccessMixin:
     @retry_on_locked
     def init_access(self, entity_id: int) -> None:
         """Initialize access tracking for a new entity (access_count=1)."""
-        self.db.execute(
-            "INSERT OR IGNORE INTO entity_access (entity_id, access_count, last_access) VALUES (?, 1, datetime('now'))",
-            (entity_id,),
-        )
-        self.db.commit()
+        with self._write_lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO entity_access (entity_id, access_count, last_access) VALUES (?, 1, datetime('now'))",
+                (entity_id,),
+            )
+            self.db.commit()
 
     @retry_on_locked
     def record_access(self, entity_id: int) -> None:
@@ -31,26 +32,27 @@ class AccessMixin:
 
         Also records a daily entry in entity_access_log for consolidation tracking.
         """
-        self.db.execute(
-            """
-            INSERT INTO entity_access (entity_id, access_count, last_access)
-            VALUES (?, 1, datetime('now'))
-            ON CONFLICT(entity_id) DO UPDATE SET
-                access_count = access_count + 1,
-                last_access = datetime('now')
-            """,
-            (entity_id,),
-        )
-        self.db.execute(
-            """
-            INSERT INTO entity_access_log (entity_id, access_date, access_count)
-            VALUES (?, DATE('now'), 1)
-            ON CONFLICT(entity_id, access_date) DO UPDATE SET
-                access_count = access_count + 1
-            """,
-            (entity_id,),
-        )
-        self.db.commit()
+        with self._write_lock:
+            self.db.execute(
+                """
+                INSERT INTO entity_access (entity_id, access_count, last_access)
+                VALUES (?, 1, datetime('now'))
+                ON CONFLICT(entity_id) DO UPDATE SET
+                    access_count = access_count + 1,
+                    last_access = datetime('now')
+                """,
+                (entity_id,),
+            )
+            self.db.execute(
+                """
+                INSERT INTO entity_access_log (entity_id, access_date, access_count)
+                VALUES (?, DATE('now'), 1)
+                ON CONFLICT(entity_id, access_date) DO UPDATE SET
+                    access_count = access_count + 1
+                """,
+                (entity_id,),
+            )
+            self.db.commit()
 
     def get_access_data(self, entity_ids: list[int]) -> dict[int, dict]:
         """Get access data for a list of entity IDs.
@@ -141,23 +143,24 @@ class AccessMixin:
     def record_co_occurrences(self, entity_ids: list[int]) -> None:
         """Record co-occurrences for all unique pairs of entity IDs.
         Canonical ordering: entity_a_id < entity_b_id always."""
-        if len(entity_ids) < 2:
-            return
-        sorted_ids = sorted(entity_ids)
-        for i in range(len(sorted_ids)):
-            for j in range(i + 1, len(sorted_ids)):
-                a, b = sorted_ids[i], sorted_ids[j]
-                self.db.execute(
-                    """
-                    INSERT INTO co_occurrences (entity_a_id, entity_b_id, co_count, last_co)
-                    VALUES (?, ?, 1, datetime('now'))
-                    ON CONFLICT(entity_a_id, entity_b_id) DO UPDATE SET
-                        co_count = co_count + 1,
-                        last_co = datetime('now')
-                    """,
-                    (a, b),
-                )
-        self.db.commit()
+        with self._write_lock:
+            if len(entity_ids) < 2:
+                return
+            sorted_ids = sorted(entity_ids)
+            for i in range(len(sorted_ids)):
+                for j in range(i + 1, len(sorted_ids)):
+                    a, b = sorted_ids[i], sorted_ids[j]
+                    self.db.execute(
+                        """
+                        INSERT INTO co_occurrences (entity_a_id, entity_b_id, co_count, last_co)
+                        VALUES (?, ?, 1, datetime('now'))
+                        ON CONFLICT(entity_a_id, entity_b_id) DO UPDATE SET
+                            co_count = co_count + 1,
+                            last_co = datetime('now')
+                        """,
+                        (a, b),
+                    )
+            self.db.commit()
 
     def get_co_occurrences(
         self, entity_ids: list[int]

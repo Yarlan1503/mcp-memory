@@ -18,26 +18,27 @@ class CoreMixin:
     @retry_on_locked
     def upsert_entity(self, name: str, entity_type: str, status: str = "activo", *, auto_commit: bool = True) -> int:
         """INSERT or UPDATE entity. Returns entity_id. Updates updated_at."""
-        self.db.execute(
-            """
-            INSERT INTO entities (name, entity_type, status)
-            VALUES (?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                entity_type = excluded.entity_type,
-                status = excluded.status,
-                updated_at  = datetime('now');
-            """,
-            (name, entity_type, status),
-        )
-        if auto_commit:
-            self.db.commit()
-        row = self.db.execute(
-            "SELECT id FROM entities WHERE name = ?", (name,)
-        ).fetchone()
-        entity_id = row["id"]  # type: ignore[return-value]
-        if auto_commit:
-            self._sync_fts(entity_id)
-        return entity_id
+        with self._write_lock:
+            self.db.execute(
+                """
+                INSERT INTO entities (name, entity_type, status)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    entity_type = excluded.entity_type,
+                    status = excluded.status,
+                    updated_at  = datetime('now');
+                """,
+                (name, entity_type, status),
+            )
+            if auto_commit:
+                self.db.commit()
+            row = self.db.execute(
+                "SELECT id FROM entities WHERE name = ?", (name,)
+            ).fetchone()
+            entity_id = row["id"]  # type: ignore[return-value]
+            if auto_commit:
+                self._sync_fts(entity_id)
+            return entity_id
 
     def get_entity_by_name(self, name: str) -> dict | None:
         """Returns entity dict or None."""
@@ -94,49 +95,50 @@ class CoreMixin:
         CRITICAL: Delete embeddings first (vec0 doesn't support CASCADE),
         then delete entities. All in a single implicit transaction.
         """
-        if not names:
-            return 0
+        with self._write_lock:
+            if not names:
+                return 0
 
-        placeholders = ",".join("?" for _ in names)
-        ids = [
-            r["id"]
-            for r in self.db.execute(
-                f"SELECT id FROM entities WHERE name IN ({placeholders})", names
-            ).fetchall()
-        ]
+            placeholders = ",".join("?" for _ in names)
+            ids = [
+                r["id"]
+                for r in self.db.execute(
+                    f"SELECT id FROM entities WHERE name IN ({placeholders})", names
+                ).fetchall()
+            ]
 
-        if not ids:
-            return 0
+            if not ids:
+                return 0
 
-        id_placeholders = ",".join("?" for _ in ids)
+            id_placeholders = ",".join("?" for _ in ids)
 
-        with self.db:
-            # 1. Delete embeddings (vec0 has no CASCADE support)
-            if self._vec_loaded:
-                try:
-                    self.db.execute(
-                        f"DELETE FROM entity_embeddings WHERE rowid IN ({id_placeholders})",
-                        ids,
-                    )
-                except Exception:
-                    logger.warning("Could not delete embeddings for entities %s", ids)
+            with self.db:
+                # 1. Delete embeddings (vec0 has no CASCADE support)
+                if self._vec_loaded:
+                    try:
+                        self.db.execute(
+                            f"DELETE FROM entity_embeddings WHERE rowid IN ({id_placeholders})",
+                            ids,
+                        )
+                    except Exception:
+                        logger.warning("Could not delete embeddings for entities %s", ids)
 
-            # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
-            if self._fts_available:
-                try:
-                    self.db.execute(
-                        f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
-                        ids,
-                    )
-                except Exception:
-                    logger.warning("Could not delete FTS entries for entities %s", ids)
+                # 2. Delete FTS entries (FTS5 doesn't CASCADE either)
+                if self._fts_available:
+                    try:
+                        self.db.execute(
+                            f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
+                            ids,
+                        )
+                    except Exception:
+                        logger.warning("Could not delete FTS entries for entities %s", ids)
 
-            # 3. Delete entities (CASCADE takes care of observations & relations)
-            self.db.execute(
-                f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
-            )
+                # 3. Delete entities (CASCADE takes care of observations & relations)
+                self.db.execute(
+                    f"DELETE FROM entities WHERE id IN ({id_placeholders})", ids
+                )
 
-            return len(ids)
+                return len(ids)
 
     def search_entities(self, query: str) -> list[dict]:
         """
@@ -189,148 +191,149 @@ class CoreMixin:
             supersedes: Optional observation ID to supersede. The referenced obs
                 will be marked with superseded_at, and the new obs will reference it.
         """
-        if not observations:
-            return 0
-
-        # Acquire write lock early to prevent contention during ONNX inference
-        # Skip if already in a transaction (e.g., called from execute_entity_split)
-        if auto_commit:
-            try:
-                self.db.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError:
-                pass  # Already in a transaction — use existing lock
-
-        # --- Handle supersedes logic ---
-        if supersedes is not None:
-            # Verify the observation exists and belongs to this entity
-            row = self.db.execute(
-                "SELECT id, entity_id, superseded_at FROM observations WHERE id = ?",
-                (supersedes,),
-            ).fetchone()
-            if row is None or row["entity_id"] != entity_id:
-                logger.warning(
-                    "Supersedes ID %s does not exist or belongs to different entity (expected %s). Ignoring.",
-                    supersedes,
-                    entity_id,
-                )
-                supersedes = None
-            elif row["superseded_at"] is not None:
-                logger.warning(
-                    "Observation %s is already superseded (at %s). Ignoring supersedes.",
-                    supersedes,
-                    row["superseded_at"],
-                )
-                supersedes = None
-
-        inserted = 0
-
-        def _dedup_observations(obs_list: list[str]) -> list[str]:
-            """Remove observations already in DB for this entity and internal duplicates."""
-            placeholders = ",".join("?" for _ in obs_list)
-            rows = self.db.execute(
-                f"SELECT content FROM observations WHERE entity_id = ? AND content IN ({placeholders})",
-                (entity_id, *obs_list),
-            ).fetchall()
-            existing_set = {r["content"] for r in rows}
-            seen: set[str] = set()
-            new_obs: list[str] = []
-            for content in obs_list:
-                if content not in existing_set and content not in seen:
-                    seen.add(content)
-                    new_obs.append(content)
-            return new_obs
-
-        def _insert_many(obs_list: list[str]) -> int:
-            """Batch insert observations with flag=0."""
-            if not obs_list:
+        with self._write_lock:
+            if not observations:
                 return 0
-            self.db.executemany(
-                "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
-                "VALUES (?, ?, 0, ?)",
-                [(entity_id, content, kind) for content in obs_list],
-            )
-            return len(obs_list)
 
-        # Try to get embedding engine for semantic dedup
-        engine = self._get_embedding_engine()
-        existing_obs = self.get_observations(entity_id)
+            # Acquire write lock early to prevent contention during ONNX inference
+            # Skip if already in a transaction (e.g., called from execute_entity_split)
+            if auto_commit:
+                try:
+                    self.db.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError:
+                    pass  # Already in a transaction — use existing lock
 
-        if existing_obs and engine is not None:
-            # --- Semantic dedup path ---
-            try:
-                import numpy as np  # noqa: F401
+            # --- Handle supersedes logic ---
+            if supersedes is not None:
+                # Verify the observation exists and belongs to this entity
+                row = self.db.execute(
+                    "SELECT id, entity_id, superseded_at FROM observations WHERE id = ?",
+                    (supersedes,),
+                ).fetchone()
+                if row is None or row["entity_id"] != entity_id:
+                    logger.warning(
+                        "Supersedes ID %s does not exist or belongs to different entity (expected %s). Ignoring.",
+                        supersedes,
+                        entity_id,
+                    )
+                    supersedes = None
+                elif row["superseded_at"] is not None:
+                    logger.warning(
+                        "Observation %s is already superseded (at %s). Ignoring supersedes.",
+                        supersedes,
+                        row["superseded_at"],
+                    )
+                    supersedes = None
 
-                # Batch encode all existing observations
-                existing_embeddings = engine.encode(existing_obs)
+            inserted = 0
 
-                # Batch exact dedup before encoding new observations
-                candidates = _dedup_observations(observations)
+            def _dedup_observations(obs_list: list[str]) -> list[str]:
+                """Remove observations already in DB for this entity and internal duplicates."""
+                placeholders = ",".join("?" for _ in obs_list)
+                rows = self.db.execute(
+                    f"SELECT content FROM observations WHERE entity_id = ? AND content IN ({placeholders})",
+                    (entity_id, *obs_list),
+                ).fetchall()
+                existing_set = {r["content"] for r in rows}
+                seen: set[str] = set()
+                new_obs: list[str] = []
+                for content in obs_list:
+                    if content not in existing_set and content not in seen:
+                        seen.add(content)
+                        new_obs.append(content)
+                return new_obs
 
-                if candidates:
-                    candidate_embeddings = engine.encode(candidates)
-
-                    for content, new_embedding in zip(candidates, candidate_embeddings):
-                        # Cosine similarity with all existing (L2-normalised → dot product)
-                        similarities = existing_embeddings @ new_embedding  # (n,)
-                        max_sim = (
-                            float(np.max(similarities)) if len(similarities) > 0 else 0.0
-                        )
-
-                        # Find the index of the most similar existing observation
-                        max_idx = (
-                            int(np.argmax(similarities)) if len(similarities) > 0 else 0
-                        )
-                        best_existing = existing_obs[max_idx] if existing_obs else ""
-
-                        # Combined similarity: cosine OR containment for asymmetric pairs
-                        from mcp_memory.scoring import combined_similarity
-
-                        flag = (
-                            1 if combined_similarity(max_sim, content, best_existing) else 0
-                        )
-
-                        self.db.execute(
-                            "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
-                            "VALUES (?, ?, ?, ?)",
-                            (entity_id, content, flag, kind),
-                        )
-                        inserted += 1
-
-            except Exception as exc:
-                logger.warning(
-                    "Semantic dedup failed, falling back to normal insert: %s", exc
+            def _insert_many(obs_list: list[str]) -> int:
+                """Batch insert observations with flag=0."""
+                if not obs_list:
+                    return 0
+                self.db.executemany(
+                    "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                    "VALUES (?, ?, 0, ?)",
+                    [(entity_id, content, kind) for content in obs_list],
                 )
-                # Fallback: dedup exact + batch insert remaining without flag
+                return len(obs_list)
+
+            # Try to get embedding engine for semantic dedup
+            engine = self._get_embedding_engine()
+            existing_obs = self.get_observations(entity_id)
+
+            if existing_obs and engine is not None:
+                # --- Semantic dedup path ---
+                try:
+                    import numpy as np  # noqa: F401
+
+                    # Batch encode all existing observations
+                    existing_embeddings = engine.encode(existing_obs)
+
+                    # Batch exact dedup before encoding new observations
+                    candidates = _dedup_observations(observations)
+
+                    if candidates:
+                        candidate_embeddings = engine.encode(candidates)
+
+                        for content, new_embedding in zip(candidates, candidate_embeddings):
+                            # Cosine similarity with all existing (L2-normalised → dot product)
+                            similarities = existing_embeddings @ new_embedding  # (n,)
+                            max_sim = (
+                                float(np.max(similarities)) if len(similarities) > 0 else 0.0
+                            )
+
+                            # Find the index of the most similar existing observation
+                            max_idx = (
+                                int(np.argmax(similarities)) if len(similarities) > 0 else 0
+                            )
+                            best_existing = existing_obs[max_idx] if existing_obs else ""
+
+                            # Combined similarity: cosine OR containment for asymmetric pairs
+                            from mcp_memory.scoring import combined_similarity
+
+                            flag = (
+                                1 if combined_similarity(max_sim, content, best_existing) else 0
+                            )
+
+                            self.db.execute(
+                                "INSERT INTO observations (entity_id, content, similarity_flag, kind) "
+                                "VALUES (?, ?, ?, ?)",
+                                (entity_id, content, flag, kind),
+                            )
+                            inserted += 1
+
+                except Exception as exc:
+                    logger.warning(
+                        "Semantic dedup failed, falling back to normal insert: %s", exc
+                    )
+                    # Fallback: dedup exact + batch insert remaining without flag
+                    new_obs = _dedup_observations(observations)
+                    inserted += _insert_many(new_obs)
+            else:
+                # --- Normal path: no engine or no existing observations ---
                 new_obs = _dedup_observations(observations)
                 inserted += _insert_many(new_obs)
-        else:
-            # --- Normal path: no engine or no existing observations ---
-            new_obs = _dedup_observations(observations)
-            inserted += _insert_many(new_obs)
 
-        # --- Apply supersedes after insertion ---
-        if supersedes is not None and inserted > 0:
-            # Mark old observation as superseded
-            self.db.execute(
-                "UPDATE observations SET superseded_at = datetime('now') WHERE id = ?",
-                (supersedes,),
-            )
-            # Get the ID of the last inserted observation for this entity
-            new_obs_row = self.db.execute(
-                "SELECT id FROM observations WHERE entity_id = ? ORDER BY id DESC LIMIT 1",
-                (entity_id,),
-            ).fetchone()
-            if new_obs_row:
+            # --- Apply supersedes after insertion ---
+            if supersedes is not None and inserted > 0:
+                # Mark old observation as superseded
                 self.db.execute(
-                    "UPDATE observations SET supersedes = ? WHERE id = ?",
-                    (supersedes, new_obs_row["id"]),
+                    "UPDATE observations SET superseded_at = datetime('now') WHERE id = ?",
+                    (supersedes,),
                 )
+                # Get the ID of the last inserted observation for this entity
+                new_obs_row = self.db.execute(
+                    "SELECT id FROM observations WHERE entity_id = ? ORDER BY id DESC LIMIT 1",
+                    (entity_id,),
+                ).fetchone()
+                if new_obs_row:
+                    self.db.execute(
+                        "UPDATE observations SET supersedes = ? WHERE id = ?",
+                        (supersedes, new_obs_row["id"]),
+                    )
 
-        if inserted:
-            if auto_commit:
-                self.db.commit()
-                self._sync_fts(entity_id)
-        return inserted
+            if inserted:
+                if auto_commit:
+                    self.db.commit()
+                    self._sync_fts(entity_id)
+            return inserted
 
     def get_observations(
         self, entity_id: int, exclude_superseded: bool = True
@@ -472,14 +475,15 @@ class CoreMixin:
     @retry_on_locked
     def delete_observations(self, entity_id: int, observations: list[str], *, auto_commit: bool = True) -> int:
         """DELETE by exact content match. Returns count deleted."""
-        if not observations:
-            return 0
-        placeholders = ",".join("?" for _ in observations)
-        cursor = self.db.execute(
-            f"DELETE FROM observations WHERE entity_id = ? AND content IN ({placeholders})",
-            [entity_id, *observations],
-        )
-        if auto_commit:
-            self.db.commit()
-            self._sync_fts(entity_id)
-        return cursor.rowcount
+        with self._write_lock:
+            if not observations:
+                return 0
+            placeholders = ",".join("?" for _ in observations)
+            cursor = self.db.execute(
+                f"DELETE FROM observations WHERE entity_id = ? AND content IN ({placeholders})",
+                [entity_id, *observations],
+            )
+            if auto_commit:
+                self.db.commit()
+                self._sync_fts(entity_id)
+            return cursor.rowcount
