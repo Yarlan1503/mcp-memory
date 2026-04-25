@@ -3,6 +3,9 @@
 import pytest
 import numpy as np
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch, MagicMock, call
 from pathlib import Path
 
@@ -374,3 +377,93 @@ class TestEncodeIntegration:
 
         # All outputs must be within atol=1e-4
         assert np.allclose(dynamic, fixed, atol=1e-4)
+
+
+class _FakeEncoding:
+    def __init__(self, ids: list[int]):
+        self.ids = ids
+        self.attention_mask = [1] * len(ids)
+
+
+class _BorrowTrackingTokenizer:
+    """Tokenizer double that fails if two encode() calls overlap."""
+
+    def __init__(self):
+        self._active = 0
+        self._lock = threading.Lock()
+        self.max_active = 0
+
+    def _enter(self):
+        with self._lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+            if self._active > 1:
+                raise RuntimeError("Already borrowed")
+
+    def _exit(self):
+        with self._lock:
+            self._active -= 1
+
+    def no_padding(self):
+        pass
+
+    def enable_padding(self, length: int):
+        self.padding_length = length
+
+    def encode_batch(self, texts: list[str]):
+        self._enter()
+        try:
+            time.sleep(0.005)
+            max_len = getattr(self, "padding_length", None)
+            encodings = []
+            for text in texts:
+                length = max(1, min(len(text.split()), max_len or 512))
+                encodings.append(_FakeEncoding(list(range(1, length + 1))))
+            return encodings
+        finally:
+            self._exit()
+
+
+class _BorrowTrackingSession:
+    """ONNX session double that fails if session.run() overlaps."""
+
+    def __init__(self):
+        self._active = 0
+        self._lock = threading.Lock()
+        self.max_active = 0
+
+    def run(self, _output_names, feed):
+        with self._lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+            if self._active > 1:
+                raise RuntimeError("Already borrowed")
+        try:
+            time.sleep(0.005)
+            input_ids = feed["input_ids"]
+            batch, seq_len = input_ids.shape
+            output = np.ones((batch, seq_len, DIMENSION), dtype=np.float32)
+            return [output]
+        finally:
+            with self._lock:
+                self._active -= 1
+
+
+def test_encode_serializes_tokenizer_and_onnx_access():
+    """Concurrent encode() calls share tokenizer/session without borrow races."""
+    engine = EmbeddingEngine.__new__(EmbeddingEngine)
+    tokenizer = _BorrowTrackingTokenizer()
+    session = _BorrowTrackingSession()
+    engine._available = True
+    engine._tokenizer = tokenizer
+    engine._session = session
+    engine._input_names = ["input_ids", "attention_mask"]
+    engine._encode_lock = threading.Lock()
+
+    texts = [[f"texto {i} con palabras"] for i in range(20)]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(engine.encode, texts))
+
+    assert all(result.shape == (1, DIMENSION) for result in results)
+    assert tokenizer.max_active == 1
+    assert session.max_active == 1

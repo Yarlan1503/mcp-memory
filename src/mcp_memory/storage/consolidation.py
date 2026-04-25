@@ -22,25 +22,62 @@ class ConsolidationMixin:
         """
         data: dict[str, Any] = {}
 
-        # --- 1. Totals ---
-        data["total_entities"] = self.db.execute(
-            "SELECT COUNT(*) FROM entities"
-        ).fetchone()[0]
+        with self._write_lock:
+            # --- 1. Totals ---
+            data["total_entities"] = self.db.execute(
+                "SELECT COUNT(*) FROM entities"
+            ).fetchone()[0]
 
-        data["total_observations"] = self.db.execute(
-            "SELECT COUNT(*) FROM observations"
-        ).fetchone()[0]
+            data["total_observations"] = self.db.execute(
+                "SELECT COUNT(*) FROM observations"
+            ).fetchone()[0]
 
-        # --- 2. Flagged observations (similarity_flag = 1) ---
-        rows = self.db.execute(
-            """
-            SELECT e.name, o.id, o.content, o.similarity_flag
-            FROM observations o
-            JOIN entities e ON e.id = o.entity_id
-            WHERE o.similarity_flag = 1
-            ORDER BY e.name, o.id
-            """
-        ).fetchall()
+            # --- 2. Flagged observations (similarity_flag = 1) ---
+            rows = self.db.execute(
+                """
+                SELECT e.name, o.id, o.content, o.similarity_flag
+                FROM observations o
+                JOIN entities e ON e.id = o.entity_id
+                WHERE o.similarity_flag = 1
+                ORDER BY e.name, o.id
+                """
+            ).fetchall()
+
+            # --- 3. Stale entities ---
+            # Entities with observations but not accessed in N days and low access count.
+            # LEFT JOIN entity_access so entities without access records are included.
+            # COALESCE handles NULLs from missing entity_access rows.
+            stale_param = str(int(stale_days))
+            stale_rows = self.db.execute(
+                """
+                SELECT e.name, e.entity_type, e.status, e.created_at,
+                       COALESCE(ea.access_count, 0) AS access_count,
+                       ea.last_access,
+                       COUNT(o.id) AS obs_count
+                FROM entities e
+                LEFT JOIN entity_access ea ON ea.entity_id = e.id
+                JOIN observations o ON o.entity_id = e.id
+                GROUP BY e.id
+                HAVING (ea.last_access IS NULL
+                        OR datetime(ea.last_access) < datetime('now', '-' || ? || ' days'))
+                   AND COALESCE(ea.access_count, 0) <= 2
+                   AND e.status != 'archivado'
+                ORDER BY CASE WHEN ea.last_access IS NULL THEN 0 ELSE 1 END,
+                         ea.last_access ASC
+                """,
+                (stale_param,),
+            ).fetchall()
+
+            # --- 4. Entity sizes ---
+            size_rows = self.db.execute(
+                """
+                SELECT e.name, COUNT(o.id) AS obs_count
+                FROM entities e
+                LEFT JOIN observations o ON o.entity_id = e.id
+                GROUP BY e.id
+                ORDER BY obs_count DESC
+                """
+            ).fetchall()
 
         flagged: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
@@ -56,31 +93,6 @@ class ConsolidationMixin:
             )
         data["flagged_observations"] = flagged
 
-        # --- 3. Stale entities ---
-        # Entities with observations but not accessed in N days and low access count.
-        # LEFT JOIN entity_access so entities without access records are included.
-        # COALESCE handles NULLs from missing entity_access rows.
-        stale_param = str(int(stale_days))
-        rows = self.db.execute(
-            """
-            SELECT e.name, e.entity_type, e.status, e.created_at,
-                   COALESCE(ea.access_count, 0) AS access_count,
-                   ea.last_access,
-                   COUNT(o.id) AS obs_count
-            FROM entities e
-            LEFT JOIN entity_access ea ON ea.entity_id = e.id
-            JOIN observations o ON o.entity_id = e.id
-            GROUP BY e.id
-            HAVING (ea.last_access IS NULL
-                    OR datetime(ea.last_access) < datetime('now', '-' || ? || ' days'))
-               AND COALESCE(ea.access_count, 0) <= 2
-               AND e.status != 'archivado'
-            ORDER BY CASE WHEN ea.last_access IS NULL THEN 0 ELSE 1 END,
-                     ea.last_access ASC
-            """,
-            (stale_param,),
-        ).fetchall()
-
         data["stale_entities"] = [
             {
                 "entity_name": r["name"],
@@ -91,20 +103,9 @@ class ConsolidationMixin:
                 "last_access": r["last_access"],
                 "observation_count": r["obs_count"],
             }
-            for r in rows
+            for r in stale_rows
         ]
 
-        # --- 4. Entity sizes ---
-        rows = self.db.execute(
-            """
-            SELECT e.name, COUNT(o.id) AS obs_count
-            FROM entities e
-            LEFT JOIN observations o ON o.entity_id = e.id
-            GROUP BY e.id
-            ORDER BY obs_count DESC
-            """
-        ).fetchall()
-
-        data["entity_sizes"] = {r["name"]: r["obs_count"] for r in rows}
+        data["entity_sizes"] = {r["name"]: r["obs_count"] for r in size_rows}
 
         return data

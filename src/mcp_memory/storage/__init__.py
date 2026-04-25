@@ -101,7 +101,8 @@ class MemoryStore(
 
     def close(self) -> None:
         """Close the database connection."""
-        self.db.close()
+        with self._write_lock:
+            self.db.close()
 
     def _get_embedding_engine(self):
         """Get embedding engine instance (best-effort). Returns None if unavailable."""
@@ -121,9 +122,10 @@ class MemoryStore(
 
     def get_metadata(self, key: str) -> str | None:
         """Get metadata value."""
-        row = self.db.execute(
-            "SELECT value FROM db_metadata WHERE key = ?", (key,)
-        ).fetchone()
+        with self._write_lock:
+            row = self.db.execute(
+                "SELECT value FROM db_metadata WHERE key = ?", (key,)
+            ).fetchone()
         return row["value"] if row else None
 
     @retry_on_locked

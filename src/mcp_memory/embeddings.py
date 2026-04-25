@@ -134,7 +134,8 @@ class EmbeddingEngine:
     @classmethod
     def reset(cls) -> None:
         """Drop the cached instance (useful for testing)."""
-        cls._instance = None
+        with cls._lock:
+            cls._instance = None
 
     # ------------------------------------------------------------------
     # Init / load
@@ -145,6 +146,11 @@ class EmbeddingEngine:
         self._session = None
         self._tokenizer = None
         self._input_names: list[str] = []
+        # The HuggingFace `tokenizers` object mutates padding state during
+        # encode() and can raise Rust "Already borrowed" errors if shared
+        # concurrently.  Serialize the full tokenise → ONNX pipeline for the
+        # singleton while leaving unrelated store/database locks untouched.
+        self._encode_lock = threading.Lock()
 
         load_dir = model_path or MODEL_DIR
 
@@ -223,54 +229,55 @@ class EmbeddingEngine:
         if not self._available:
             raise RuntimeError("Embedding model not available")
 
-        # 1. Tokenise with dynamic padding -----------------------------
-        # First pass: find max length without padding
-        self._tokenizer.no_padding()
-        encoded_raw = self._tokenizer.encode_batch(texts)
-        max_len = max(len(e.ids) for e in encoded_raw)
+        with self._encode_lock:
+            # 1. Tokenise with dynamic padding -----------------------------
+            # First pass: find max length without padding
+            self._tokenizer.no_padding()
+            encoded_raw = self._tokenizer.encode_batch(texts)
+            max_len = max(len(e.ids) for e in encoded_raw)
 
-        # Second pass: pad to the actual max length of this batch
-        self._tokenizer.enable_padding(length=max_len)
-        encoded = self._tokenizer.encode_batch(texts)
+            # Second pass: pad to the actual max length of this batch
+            self._tokenizer.enable_padding(length=max_len)
+            encoded = self._tokenizer.encode_batch(texts)
 
-        input_ids = np.array(
-            [e.ids for e in encoded],
-            dtype=np.int64,
-        )
-        attention_mask = np.array(
-            [e.attention_mask for e in encoded],
-            dtype=np.int64,
-        )
+            input_ids = np.array(
+                [e.ids for e in encoded],
+                dtype=np.int64,
+            )
+            attention_mask = np.array(
+                [e.attention_mask for e in encoded],
+                dtype=np.int64,
+            )
 
-        # 2. Build ONNX feed dict (dynamic input discovery) -------------
-        feed: dict[str, np.ndarray] = {}
-        for name in self._input_names:
-            if name == "input_ids":
-                feed[name] = input_ids
-            elif name == "attention_mask":
-                feed[name] = attention_mask
-            elif name == "token_type_ids":
-                feed[name] = np.zeros_like(input_ids)
-            else:
-                logger.warning("Unknown ONNX input '%s' — filling with zeros", name)
-                feed[name] = np.zeros_like(input_ids)
+            # 2. Build ONNX feed dict (dynamic input discovery) -------------
+            feed: dict[str, np.ndarray] = {}
+            for name in self._input_names:
+                if name == "input_ids":
+                    feed[name] = input_ids
+                elif name == "attention_mask":
+                    feed[name] = attention_mask
+                elif name == "token_type_ids":
+                    feed[name] = np.zeros_like(input_ids)
+                else:
+                    logger.warning("Unknown ONNX input '%s' — filling with zeros", name)
+                    feed[name] = np.zeros_like(input_ids)
 
-        # 3. ONNX inference ---------------------------------------------
-        outputs = self._session.run(None, feed)
-        token_embeddings = outputs[0]  # (batch, seq_len, 384)
+            # 3. ONNX inference ---------------------------------------------
+            outputs = self._session.run(None, feed)
+            token_embeddings = outputs[0]  # (batch, seq_len, 384)
 
-        # 4. Mean pooling (mask out [PAD] tokens) -----------------------
-        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
-        sum_embeddings = np.sum(token_embeddings * mask_expanded, axis=1)
-        sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-        mean_embeddings = sum_embeddings / sum_mask
+            # 4. Mean pooling (mask out [PAD] tokens) -----------------------
+            mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
+            sum_embeddings = np.sum(token_embeddings * mask_expanded, axis=1)
+            sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+            mean_embeddings = sum_embeddings / sum_mask
 
-        # 5. L2 normalise → float32 -------------------------------------
-        norms = np.linalg.norm(mean_embeddings, axis=1, keepdims=True)
-        norms = np.clip(norms, a_min=1e-9, a_max=None)
-        normalized = mean_embeddings / norms
+            # 5. L2 normalise → float32 -------------------------------------
+            norms = np.linalg.norm(mean_embeddings, axis=1, keepdims=True)
+            norms = np.clip(norms, a_min=1e-9, a_max=None)
+            normalized = mean_embeddings / norms
 
-        return normalized.astype(np.float32)
+            return normalized.astype(np.float32)
 
     @staticmethod
     def _format_obs(obs: str | dict) -> str:

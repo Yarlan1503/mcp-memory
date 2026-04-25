@@ -1,6 +1,7 @@
 """FTS5 search, embedding operations, and search event logging for the MCP Memory knowledge graph."""
 
 import logging
+import sqlite3
 
 from mcp_memory.retry import retry_on_locked
 
@@ -41,16 +42,17 @@ class SearchMixin:
             logger.warning("sqlite-vec not loaded — cannot search embeddings.")
             return []
         try:
-            rows = self.db.execute(
-                """
-                SELECT rowid, distance
-                FROM entity_embeddings
-                WHERE embedding MATCH ?
-                ORDER BY distance
-                LIMIT ?;
-                """,
-                (query_embedding, limit),
-            ).fetchall()
+            with self._write_lock:
+                rows = self.db.execute(
+                    """
+                    SELECT rowid, distance
+                    FROM entity_embeddings
+                    WHERE embedding MATCH ?
+                    ORDER BY distance
+                    LIMIT ?;
+                    """,
+                    (query_embedding, limit),
+                ).fetchall()
             return [
                 {"entity_id": r["rowid"], "distance": float(r["distance"])}
                 for r in rows
@@ -98,6 +100,8 @@ class SearchMixin:
                     self.db.commit()
             except Exception as exc:
                 logger.warning("FTS sync failed for entity %s: %s", entity_id, exc)
+                if isinstance(exc, sqlite3.OperationalError):
+                    raise
 
     @retry_on_locked
     def _backfill_fts(self) -> None:
@@ -122,6 +126,8 @@ class SearchMixin:
                 logger.info("FTS index backfilled with %d entities.", len(entities))
             except Exception as exc:
                 logger.error("FTS backfill failed: %s", exc)
+                if isinstance(exc, sqlite3.OperationalError):
+                    raise
 
     def search_fts(self, query: str, limit: int = 10) -> list[dict]:
         """FTS5 full-text search using BM25 ranking.
@@ -133,23 +139,24 @@ class SearchMixin:
         if not self._fts_available or not query.strip():
             return []
         try:
-            # Escape FTS5 special characters: " * ( ) : ^
-            # Wrap each token in double quotes for exact matching
-            tokens = query.strip().split()
-            escaped = " ".join(f'"{t}"' for t in tokens if t)
-            if not escaped:
-                return []
+            with self._write_lock:
+                # Escape FTS5 special characters: " * ( ) : ^
+                # Wrap each token in double quotes for exact matching
+                tokens = query.strip().split()
+                escaped = " ".join(f'"{t}"' for t in tokens if t)
+                if not escaped:
+                    return []
 
-            rows = self.db.execute(
-                """
-                SELECT rowid AS entity_id, rank
-                FROM entity_fts
-                WHERE entity_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?;
-                """,
-                (escaped, limit),
-            ).fetchall()
+                rows = self.db.execute(
+                    """
+                    SELECT rowid AS entity_id, rank
+                    FROM entity_fts
+                    WHERE entity_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?;
+                    """,
+                    (escaped, limit),
+                ).fetchall()
             # FTS5 rank is negative (lower = better). Negate for conventional ordering.
             return [
                 {"entity_id": r["entity_id"], "rank": -float(r["rank"])} for r in rows
@@ -254,3 +261,4 @@ class SearchMixin:
                 logger.error(
                     "Failed to update search event %s completion: %s", event_id, exc
                 )
+                raise

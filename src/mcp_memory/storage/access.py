@@ -60,18 +60,19 @@ class AccessMixin:
         Defaults to access_count=0, last_access=created_at if no record exists."""
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        rows = self.db.execute(
-            f"""
-            SELECT e.id, e.created_at,
-                   COALESCE(ea.access_count, 0) AS access_count,
-                   COALESCE(ea.last_access, e.created_at) AS last_access
-            FROM entities e
-            LEFT JOIN entity_access ea ON ea.entity_id = e.id
-            WHERE e.id IN ({placeholders})
-            """,
-            entity_ids,
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT e.id, e.created_at,
+                       COALESCE(ea.access_count, 0) AS access_count,
+                       COALESCE(ea.last_access, e.created_at) AS last_access
+                FROM entities e
+                LEFT JOIN entity_access ea ON ea.entity_id = e.id
+                WHERE e.id IN ({placeholders})
+                """,
+                entity_ids,
+            ).fetchall()
         return {
             r["id"]: {
                 "access_count": r["access_count"],
@@ -89,16 +90,17 @@ class AccessMixin:
         """
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        rows = self.db.execute(
-            f"""
-            SELECT entity_id, COUNT(*) as access_days
-            FROM entity_access_log
-            WHERE entity_id IN ({placeholders})
-            GROUP BY entity_id
-            """,
-            entity_ids,
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT entity_id, COUNT(*) as access_days
+                FROM entity_access_log
+                WHERE entity_id IN ({placeholders})
+                GROUP BY entity_id
+                """,
+                entity_ids,
+            ).fetchall()
         return {r["entity_id"]: r["access_days"] for r in rows}
 
     def days_since_access(self, last_access: str | None) -> int | None:
@@ -106,10 +108,11 @@ class AccessMixin:
         if last_access is None:
             return None
         try:
-            row = self.db.execute(
-                "SELECT CAST(julianday('now') - julianday(?) AS INTEGER)",
-                (last_access,),
-            ).fetchone()
+            with self._write_lock:
+                row = self.db.execute(
+                    "SELECT CAST(julianday('now') - julianday(?) AS INTEGER)",
+                    (last_access,),
+                ).fetchone()
             return row[0] if row else None
         except Exception:
             return None
@@ -119,17 +122,18 @@ class AccessMixin:
         Counts relations where entity is either from_entity or to_entity."""
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        rows = self.db.execute(
-            f"""
-            SELECT entity_id, COUNT(*) AS degree FROM (
-                SELECT from_entity AS entity_id FROM relations WHERE from_entity IN ({placeholders})
-                UNION ALL
-                SELECT to_entity AS entity_id FROM relations WHERE to_entity IN ({placeholders})
-            ) GROUP BY entity_id
-            """,
-            entity_ids + entity_ids,
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT entity_id, COUNT(*) AS degree FROM (
+                    SELECT from_entity AS entity_id FROM relations WHERE from_entity IN ({placeholders})
+                    UNION ALL
+                    SELECT to_entity AS entity_id FROM relations WHERE to_entity IN ({placeholders})
+                ) GROUP BY entity_id
+                """,
+                entity_ids + entity_ids,
+            ).fetchall()
         result = {eid: 0 for eid in entity_ids}
         for r in rows:
             result[r["entity_id"]] = r["degree"]
@@ -170,15 +174,16 @@ class AccessMixin:
         if len(entity_ids) < 2:
             return {}
         id_set = set(entity_ids)
-        placeholders = ",".join("?" for _ in entity_ids)
-        rows = self.db.execute(
-            f"""
-            SELECT entity_a_id, entity_b_id, co_count, last_co
-            FROM co_occurrences
-            WHERE entity_a_id IN ({placeholders}) AND entity_b_id IN ({placeholders})
-            """,
-            entity_ids + entity_ids,
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT entity_a_id, entity_b_id, co_count, last_co
+                FROM co_occurrences
+                WHERE entity_a_id IN ({placeholders}) AND entity_b_id IN ({placeholders})
+                """,
+                entity_ids + entity_ids,
+            ).fetchall()
         return {
             (r["entity_a_id"], r["entity_b_id"]): {
                 "co_count": r["co_count"],

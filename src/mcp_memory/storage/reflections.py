@@ -106,15 +106,16 @@ class ReflectionsMixin:
         self, target_type: str, target_id: int | None = None
     ) -> list[dict]:
         """Get reflections for a specific target (entity, session, relation, or global)."""
-        if target_type == "global":
-            rows = self.db.execute(
-                "SELECT id, author, content, mood, created_at FROM reflections WHERE target_type = 'global' ORDER BY created_at"
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                "SELECT id, author, content, mood, created_at FROM reflections WHERE target_type = ? AND target_id = ? ORDER BY created_at",
-                (target_type, target_id),
-            ).fetchall()
+        with self._write_lock:
+            if target_type == "global":
+                rows = self.db.execute(
+                    "SELECT id, author, content, mood, created_at FROM reflections WHERE target_type = 'global' ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT id, author, content, mood, created_at FROM reflections WHERE target_type = ? AND target_id = ? ORDER BY created_at",
+                    (target_type, target_id),
+                ).fetchall()
         return [
             {
                 "id": r["id"],
@@ -135,12 +136,13 @@ class ReflectionsMixin:
         """
         if not target_ids or target_type == "global":
             return {}
-        placeholders = ",".join("?" for _ in target_ids)
-        rows = self.db.execute(
-            f"SELECT id, target_id, author, content, mood, created_at FROM reflections "
-            f"WHERE target_type = ? AND target_id IN ({placeholders}) ORDER BY created_at",
-            (target_type, *target_ids),
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in target_ids)
+            rows = self.db.execute(
+                f"SELECT id, target_id, author, content, mood, created_at FROM reflections "
+                f"WHERE target_type = ? AND target_id IN ({placeholders}) ORDER BY created_at",
+                (target_type, *target_ids),
+            ).fetchall()
         result = {tid: [] for tid in target_ids}
         for r in rows:
             result[r["target_id"]].append(
@@ -159,20 +161,21 @@ class ReflectionsMixin:
         if not self._fts_available or not query.strip():
             return []
         try:
-            tokens = query.strip().split()
-            escaped = " ".join(f'"{t}"' for t in tokens if t)
-            if not escaped:
-                return []
-            rows = self.db.execute(
-                """
-                SELECT rowid AS id, rank
-                FROM reflection_fts
-                WHERE reflection_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (escaped, limit),
-            ).fetchall()
+            with self._write_lock:
+                tokens = query.strip().split()
+                escaped = " ".join(f'"{t}"' for t in tokens if t)
+                if not escaped:
+                    return []
+                rows = self.db.execute(
+                    """
+                    SELECT rowid AS id, rank
+                    FROM reflection_fts
+                    WHERE reflection_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (escaped, limit),
+                ).fetchall()
             return [{"id": r["id"], "rank": -float(r["rank"])} for r in rows]
         except Exception as exc:
             logger.warning("Reflection FTS search failed: %s", exc)
@@ -185,16 +188,17 @@ class ReflectionsMixin:
         if not self._vec_loaded:
             return []
         try:
-            rows = self.db.execute(
-                """
-                SELECT rowid AS id, distance
-                FROM reflection_embeddings
-                WHERE embedding MATCH ?
-                ORDER BY distance
-                LIMIT ?
-                """,
-                (query_embedding, limit),
-            ).fetchall()
+            with self._write_lock:
+                rows = self.db.execute(
+                    """
+                    SELECT rowid AS id, distance
+                    FROM reflection_embeddings
+                    WHERE embedding MATCH ?
+                    ORDER BY distance
+                    LIMIT ?
+                    """,
+                    (query_embedding, limit),
+                ).fetchall()
             return [{"id": r["id"], "distance": float(r["distance"])} for r in rows]
         except Exception as exc:
             logger.warning("Reflection embedding search failed: %s", exc)
@@ -237,5 +241,6 @@ class ReflectionsMixin:
         if conditions:
             query_sql += " AND " + " AND ".join(conditions)
 
-        rows = self.db.execute(query_sql, params).fetchall()
+        with self._write_lock:
+            rows = self.db.execute(query_sql, params).fetchall()
         return [dict(r) for r in rows]

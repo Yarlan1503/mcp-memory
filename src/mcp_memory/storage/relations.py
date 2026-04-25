@@ -98,11 +98,12 @@ class RelationsMixin:
 
     def get_relation_by_id(self, relation_id: int) -> dict | None:
         """Get a single relation by its ID. Returns dict or None."""
-        row = self.db.execute(
-            "SELECT id, from_entity, to_entity, relation_type, context, active, ended_at, created_at "
-            "FROM relations WHERE id = ?",
-            (relation_id,),
-        ).fetchone()
+        with self._write_lock:
+            row = self.db.execute(
+                "SELECT id, from_entity, to_entity, relation_type, context, active, ended_at, created_at "
+                "FROM relations WHERE id = ?",
+                (relation_id,),
+            ).fetchone()
         if row is None:
             return None
         return dict(row)
@@ -127,15 +128,16 @@ class RelationsMixin:
         """All relations with entity names (JOIN).
         Returns list of {"from": entity_name, "to": entity_name, "relationType": relation_type,
                           "context": str|None, "active": 1|0, "ended_at": str|None}."""
-        rows = self.db.execute(
-            """
-            SELECT e1.name AS from_name, e2.name AS to_name, r.relation_type,
-                   r.context, r.active, r.ended_at
-            FROM relations r
-            JOIN entities e1 ON r.from_entity = e1.id
-            JOIN entities e2 ON r.to_entity   = e2.id;
-            """
-        ).fetchall()
+        with self._write_lock:
+            rows = self.db.execute(
+                """
+                SELECT e1.name AS from_name, e2.name AS to_name, r.relation_type,
+                       r.context, r.active, r.ended_at
+                FROM relations r
+                JOIN entities e1 ON r.from_entity = e1.id
+                JOIN entities e2 ON r.to_entity   = e2.id;
+                """
+            ).fetchall()
         return [
             {
                 "from": r["from_name"],
@@ -154,18 +156,19 @@ class RelationsMixin:
         Returns list of dicts with relation_type, target_name, direction,
         context, active, and ended_at.
         """
-        rows = self.db.execute(
-            """
-            SELECT r.id, r.from_entity, r.to_entity, r.relation_type,
-                   r.context, r.active, r.ended_at,
-                   e_from.name AS from_name, e_to.name AS to_name
-            FROM relations r
-            JOIN entities e_from ON r.from_entity = e_from.id
-            JOIN entities e_to ON r.to_entity = e_to.id
-            WHERE r.from_entity = ? OR r.to_entity = ?
-            """,
-            (entity_id, entity_id),
-        ).fetchall()
+        with self._write_lock:
+            rows = self.db.execute(
+                """
+                SELECT r.id, r.from_entity, r.to_entity, r.relation_type,
+                       r.context, r.active, r.ended_at,
+                       e_from.name AS from_name, e_to.name AS to_name
+                FROM relations r
+                JOIN entities e_from ON r.from_entity = e_from.id
+                JOIN entities e_to ON r.to_entity = e_to.id
+                WHERE r.from_entity = ? OR r.to_entity = ?
+                """,
+                (entity_id, entity_id),
+            ).fetchall()
 
         result = []
         for r in rows:
@@ -199,10 +202,11 @@ class RelationsMixin:
         Returns the relation dict with id and active status if found and active,
         otherwise None.
         """
-        row = self.db.execute(
-            "SELECT id, active FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
-            (to_entity_id, from_entity_id, relation_type),
-        ).fetchone()
+        with self._write_lock:
+            row = self.db.execute(
+                "SELECT id, active FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
+                (to_entity_id, from_entity_id, relation_type),
+            ).fetchone()
         if row and row["active"] == 1:
             return dict(row)
         return None
@@ -215,19 +219,20 @@ class RelationsMixin:
         """
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        rows = self.db.execute(
-            f"""
-            SELECT r.id, r.from_entity, r.to_entity, r.relation_type,
-                   r.context, r.active, r.ended_at,
-                   e_from.name AS from_name, e_to.name AS to_name
-            FROM relations r
-            JOIN entities e_from ON r.from_entity = e_from.id
-            JOIN entities e_to ON r.to_entity = e_to.id
-            WHERE r.from_entity IN ({placeholders}) OR r.to_entity IN ({placeholders})
-            """,
-            entity_ids + entity_ids,
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT r.id, r.from_entity, r.to_entity, r.relation_type,
+                       r.context, r.active, r.ended_at,
+                       e_from.name AS from_name, e_to.name AS to_name
+                FROM relations r
+                JOIN entities e_from ON r.from_entity = e_from.id
+                JOIN entities e_to ON r.to_entity = e_to.id
+                WHERE r.from_entity IN ({placeholders}) OR r.to_entity IN ({placeholders})
+                """,
+                entity_ids + entity_ids,
+            ).fetchall()
         result = {eid: [] for eid in entity_ids}
         for r in rows:
             if r["from_entity"] in result:

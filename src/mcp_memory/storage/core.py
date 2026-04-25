@@ -42,33 +42,36 @@ class CoreMixin:
 
     def get_entity_by_name(self, name: str) -> dict | None:
         """Returns entity dict or None."""
-        row = self.db.execute(
-            "SELECT id, name, entity_type, status, created_at, updated_at FROM entities WHERE name = ?",
-            (name,),
-        ).fetchone()
+        with self._write_lock:
+            row = self.db.execute(
+                "SELECT id, name, entity_type, status, created_at, updated_at FROM entities WHERE name = ?",
+                (name,),
+            ).fetchone()
         if row is None:
             return None
         return dict(row)
 
     def get_entity_by_id(self, entity_id: int) -> dict | None:
         """Get entity by ID."""
-        row = self.db.execute(
-            "SELECT id, name, entity_type, status, created_at, updated_at FROM entities WHERE id = ?",
-            (entity_id,),
-        ).fetchone()
+        with self._write_lock:
+            row = self.db.execute(
+                "SELECT id, name, entity_type, status, created_at, updated_at FROM entities WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
         if row is None:
             return None
         return dict(row)
 
     def get_all_entities(self) -> list[dict]:
         """All entities with their observations. Single query via LEFT JOIN."""
-        rows = self.db.execute(
-            "SELECT e.id, e.name, e.entity_type, e.status, e.created_at, e.updated_at, "
-            "o.content "
-            "FROM entities e "
-            "LEFT JOIN observations o ON o.entity_id = e.id AND o.superseded_at IS NULL "
-            "ORDER BY e.id, o.id"
-        ).fetchall()
+        with self._write_lock:
+            rows = self.db.execute(
+                "SELECT e.id, e.name, e.entity_type, e.status, e.created_at, e.updated_at, "
+                "o.content "
+                "FROM entities e "
+                "LEFT JOIN observations o ON o.entity_id = e.id AND o.superseded_at IS NULL "
+                "ORDER BY e.id, o.id"
+            ).fetchall()
 
         entities_map: dict[int, dict] = {}
         for row in rows:
@@ -130,6 +133,8 @@ class CoreMixin:
                             f"DELETE FROM entity_fts WHERE rowid IN ({id_placeholders})",
                             ids,
                         )
+                    except sqlite3.OperationalError:
+                        raise
                     except Exception:
                         logger.warning("Could not delete FTS entries for entities %s", ids)
 
@@ -146,24 +151,25 @@ class CoreMixin:
         Returns entities with their observations.
         Uses 2 queries instead of N+1.
         """
-        pattern = f"%{query}%"
-        rows = self.db.execute(
-            """
-            SELECT DISTINCT e.id, e.name, e.entity_type, e.status, e.created_at, e.updated_at
-            FROM entities e
-            LEFT JOIN observations o ON o.entity_id = e.id
-            WHERE e.name LIKE ? OR e.entity_type LIKE ? OR o.content LIKE ?
-            """,
-            (pattern, pattern, pattern),
-        ).fetchall()
+        with self._write_lock:
+            pattern = f"%{query}%"
+            rows = self.db.execute(
+                """
+                SELECT DISTINCT e.id, e.name, e.entity_type, e.status, e.created_at, e.updated_at
+                FROM entities e
+                LEFT JOIN observations o ON o.entity_id = e.id
+                WHERE e.name LIKE ? OR e.entity_type LIKE ? OR o.content LIKE ?
+                """,
+                (pattern, pattern, pattern),
+            ).fetchall()
 
-        if not rows:
-            return []
+            if not rows:
+                return []
 
-        entity_ids = [r["id"] for r in rows]
-        obs_map = self.get_observations_batch(entity_ids)
+            entity_ids = [r["id"] for r in rows]
+            obs_map = self.get_observations_batch(entity_ids)
 
-        return [{**dict(r), "observations": obs_map.get(r["id"], [])} for r in rows]
+            return [{**dict(r), "observations": obs_map.get(r["id"], [])} for r in rows]
 
     # ------------------------------------------------------------------
     # Observation CRUD
@@ -195,13 +201,13 @@ class CoreMixin:
             if not observations:
                 return 0
 
-            # Acquire write lock early to prevent contention during ONNX inference
-            # Skip if already in a transaction (e.g., called from execute_entity_split)
-            if auto_commit:
-                try:
-                    self.db.execute("BEGIN IMMEDIATE")
-                except sqlite3.OperationalError:
-                    pass  # Already in a transaction — use existing lock
+            # Acquire write lock early to prevent contention during ONNX inference.
+            # Respect sqlite3's transaction state: callers with auto_commit=False
+            # own the surrounding transaction, and an active transaction must not
+            # receive a nested BEGIN. OperationalError (e.g. database is locked)
+            # must propagate so retry_on_locked can rollback/retry the operation.
+            if auto_commit and self.db.in_transaction is not True:
+                self.db.execute("BEGIN IMMEDIATE")
 
             # --- Handle supersedes logic ---
             if supersedes is not None:
@@ -299,6 +305,8 @@ class CoreMixin:
                             )
                             inserted += 1
 
+                except sqlite3.OperationalError:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "Semantic dedup failed, falling back to normal insert: %s", exc
@@ -329,10 +337,13 @@ class CoreMixin:
                         (supersedes, new_obs_row["id"]),
                     )
 
-            if inserted:
-                if auto_commit:
-                    self.db.commit()
-                    self._sync_fts(entity_id)
+            if auto_commit:
+                if inserted:
+                    # Run FTS update inside this transaction. Call the undecorated
+                    # implementation so any OperationalError rolls back/retries
+                    # the whole add_observations unit, not just the FTS fragment.
+                    type(self)._sync_fts.__wrapped__(self, entity_id, auto_commit=False)
+                self.db.commit()
             return inserted
 
     def get_observations(
@@ -344,16 +355,17 @@ class CoreMixin:
             entity_id: The entity ID.
             exclude_superseded: If True, exclude observations that have been superseded.
         """
-        if exclude_superseded:
-            rows = self.db.execute(
-                "SELECT content FROM observations WHERE entity_id = ? AND superseded_at IS NULL ORDER BY id",
-                (entity_id,),
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-                (entity_id,),
-            ).fetchall()
+        with self._write_lock:
+            if exclude_superseded:
+                rows = self.db.execute(
+                    "SELECT content FROM observations WHERE entity_id = ? AND superseded_at IS NULL ORDER BY id",
+                    (entity_id,),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+                    (entity_id,),
+                ).fetchall()
         return [r["content"] for r in rows]
 
     def get_observations_with_ids(
@@ -365,18 +377,19 @@ class CoreMixin:
             entity_id: The entity ID.
             exclude_superseded: If True, exclude observations that have been superseded.
         """
-        if exclude_superseded:
-            rows = self.db.execute(
-                "SELECT id, content, similarity_flag, kind, supersedes, superseded_at "
-                "FROM observations WHERE entity_id = ? AND superseded_at IS NULL ORDER BY id",
-                (entity_id,),
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                "SELECT id, content, similarity_flag, kind, supersedes, superseded_at "
-                "FROM observations WHERE entity_id = ? ORDER BY id",
-                (entity_id,),
-            ).fetchall()
+        with self._write_lock:
+            if exclude_superseded:
+                rows = self.db.execute(
+                    "SELECT id, content, similarity_flag, kind, supersedes, superseded_at "
+                    "FROM observations WHERE entity_id = ? AND superseded_at IS NULL ORDER BY id",
+                    (entity_id,),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT id, content, similarity_flag, kind, supersedes, superseded_at "
+                    "FROM observations WHERE entity_id = ? ORDER BY id",
+                    (entity_id,),
+                ).fetchall()
         return [
             {
                 "id": r["id"],
@@ -396,21 +409,22 @@ class CoreMixin:
         Returns dict mapping entity_id -> list of observation content strings."""
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        if exclude_superseded:
-            rows = self.db.execute(
-                f"SELECT entity_id, content FROM observations "
-                f"WHERE entity_id IN ({placeholders}) AND superseded_at IS NULL "
-                f"ORDER BY entity_id, id",
-                entity_ids,
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                f"SELECT entity_id, content FROM observations "
-                f"WHERE entity_id IN ({placeholders}) "
-                f"ORDER BY entity_id, id",
-                entity_ids,
-            ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            if exclude_superseded:
+                rows = self.db.execute(
+                    f"SELECT entity_id, content FROM observations "
+                    f"WHERE entity_id IN ({placeholders}) AND superseded_at IS NULL "
+                    f"ORDER BY entity_id, id",
+                    entity_ids,
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    f"SELECT entity_id, content FROM observations "
+                    f"WHERE entity_id IN ({placeholders}) "
+                    f"ORDER BY entity_id, id",
+                    entity_ids,
+                ).fetchall()
 
         result: dict[int, list[str]] = {}
         for row in rows:
@@ -425,23 +439,24 @@ class CoreMixin:
         kind, supersedes, superseded_at}."""
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        if exclude_superseded:
-            rows = self.db.execute(
-                f"SELECT id, entity_id, content, similarity_flag, kind, supersedes, superseded_at "
-                f"FROM observations "
-                f"WHERE entity_id IN ({placeholders}) AND superseded_at IS NULL "
-                f"ORDER BY entity_id, id",
-                entity_ids,
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                f"SELECT id, entity_id, content, similarity_flag, kind, supersedes, superseded_at "
-                f"FROM observations "
-                f"WHERE entity_id IN ({placeholders}) "
-                f"ORDER BY entity_id, id",
-                entity_ids,
-            ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            if exclude_superseded:
+                rows = self.db.execute(
+                    f"SELECT id, entity_id, content, similarity_flag, kind, supersedes, superseded_at "
+                    f"FROM observations "
+                    f"WHERE entity_id IN ({placeholders}) AND superseded_at IS NULL "
+                    f"ORDER BY entity_id, id",
+                    entity_ids,
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    f"SELECT id, entity_id, content, similarity_flag, kind, supersedes, superseded_at "
+                    f"FROM observations "
+                    f"WHERE entity_id IN ({placeholders}) "
+                    f"ORDER BY entity_id, id",
+                    entity_ids,
+                ).fetchall()
 
         result: dict[int, list[dict]] = {}
         for r in rows:
@@ -464,12 +479,13 @@ class CoreMixin:
         created_at, updated_at}."""
         if not entity_ids:
             return {}
-        placeholders = ",".join("?" for _ in entity_ids)
-        rows = self.db.execute(
-            f"SELECT id, name, entity_type, status, created_at, updated_at "
-            f"FROM entities WHERE id IN ({placeholders})",
-            entity_ids,
-        ).fetchall()
+        with self._write_lock:
+            placeholders = ",".join("?" for _ in entity_ids)
+            rows = self.db.execute(
+                f"SELECT id, name, entity_type, status, created_at, updated_at "
+                f"FROM entities WHERE id IN ({placeholders})",
+                entity_ids,
+            ).fetchall()
         return {r["id"]: dict(r) for r in rows}
 
     @retry_on_locked
