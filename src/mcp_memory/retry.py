@@ -1,10 +1,11 @@
 """Retry utility for SQLite write operations under concurrent access."""
 
 import functools
+import logging
 import random
 import sqlite3
 import time
-import logging
+from contextlib import nullcontext
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +36,16 @@ def retry_on_locked(func):
                 if attempt == MAX_RETRIES:
                     raise
                 last_exc = exc
-                # Rollback any pending transaction before retrying
+                # Rollback any pending transaction before retrying.  MemoryStore
+                # intentionally serializes access to its shared sqlite3
+                # connection with _write_lock; rollback must use the same lock
+                # or a concurrent thread could start a new transaction between
+                # the failed attempt and this cleanup.
                 try:
-                    args[0].db.rollback()
+                    owner = args[0]
+                    lock = getattr(owner, "_write_lock", None)
+                    with lock if lock is not None else nullcontext():
+                        owner.db.rollback()
                 except Exception:
                     pass  # No transaction active or no .db attribute
                 delay = min(BASE_DELAY * (2**attempt), MAX_DELAY)

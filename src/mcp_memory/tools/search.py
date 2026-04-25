@@ -2,7 +2,6 @@
 
 import hashlib
 import logging
-import math
 import random
 import time
 from typing import Any
@@ -342,6 +341,17 @@ def _build_search_output(
     return output, top_k_ids
 
 
+def _cosine_sim_from_distance(distance: float | None) -> float | None:
+    """Convert vector distance to cosine similarity when distance exists.
+
+    Hybrid search can include FTS-only results whose distance is intentionally
+    None. Preserve that semantic instead of treating None as a numeric value.
+    """
+    if distance is None:
+        return None
+    return max(0.0, 1.0 - distance)
+
+
 def _log_shadow_and_track(
     event_id: int | None,
     ranked: list[dict],
@@ -379,8 +389,8 @@ def _log_shadow_and_track(
 
                 if treatment == 1:
                     log_entry["limbic_score"] = rank_item.get("limbic_score", 0.0)
-                    log_entry["cosine_sim"] = max(
-                        0.0, 1.0 - rank_item.get("distance", 1.0)
+                    log_entry["cosine_sim"] = _cosine_sim_from_distance(
+                        rank_item.get("distance")
                     )
                     log_entry["importance"] = rank_item.get("importance", 0.0)
                     log_entry["temporal"] = rank_item.get("temporal_factor", 1.0)
@@ -507,7 +517,6 @@ def open_nodes(
     entity_ids = [e["id"] for e in entities_list]
 
     # 2. Batch prefetch (4 queries total)
-    entities_map = store.get_entities_batch(entity_ids)
     obs_map = store.get_observations_with_ids_batch(
         entity_ids, exclude_superseded=not include_superseded
     )
@@ -579,7 +588,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             "error": "Embedding model not available. Run 'python scripts/download_model.py' to download the model first.",
         }
 
-    from mcp_memory.scoring import RoutingStrategy, detect_query_type
+    from mcp_memory.scoring import detect_query_type
 
     # Determine treatment and routing
     treatment = _get_treatment(query)
@@ -614,7 +623,7 @@ def search_semantic(query: str, limit: int = 10) -> dict[str, Any]:
             query_text=query,
             treatment=treatment,
             k_limit=limit,
-            num_results=None,
+            num_results=0,  # Will update after ranking/logging
             duration_ms=None,
             engine_used="limbic" if treatment == 1 else "baseline",
         )

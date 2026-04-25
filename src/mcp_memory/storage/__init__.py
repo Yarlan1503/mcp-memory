@@ -3,6 +3,8 @@
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from mcp_memory.retry import retry_on_locked
@@ -53,12 +55,17 @@ class MemoryStore(
         Creates parent directory if needed.
         Uses check_same_thread=False.
         """
+        connect_kwargs = {
+            "check_same_thread": False,
+            "timeout": 10.0,
+            "cached_statements": 256,
+        }
         if db_path == ":memory:":
-            self.db = sqlite3.connect(":memory:", check_same_thread=False)
+            self.db = sqlite3.connect(":memory:", **connect_kwargs)
         else:
             resolved = Path(db_path).expanduser().resolve()
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            self.db = sqlite3.connect(str(resolved), check_same_thread=False)
+            self.db = sqlite3.connect(str(resolved), **connect_kwargs)
         self._write_lock = threading.RLock()
         self.db.row_factory = sqlite3.Row
 
@@ -103,6 +110,29 @@ class MemoryStore(
         """Close the database connection."""
         with self._write_lock:
             self.db.close()
+
+    @contextmanager
+    def write_transaction(self, *, immediate: bool = True) -> Iterator[None]:
+        """Serialize a SQLite write transaction on this store's connection.
+
+        This is the canonical transaction manager for composite write units.
+        It keeps BEGIN/COMMIT/ROLLBACK under the same RLock used by individual
+        CRUD methods, avoiding unsafe cross-thread rollback/commit races on the
+        shared local SQLite connection. Nested callers join the outer transaction.
+        """
+        with self._write_lock:
+            nested = self.db.in_transaction
+            if not nested:
+                self.db.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield
+            except Exception:
+                if not nested:
+                    self.db.rollback()
+                raise
+            else:
+                if not nested:
+                    self.db.commit()
 
     def _get_embedding_engine(self):
         """Get embedding engine instance (best-effort). Returns None if unavailable."""

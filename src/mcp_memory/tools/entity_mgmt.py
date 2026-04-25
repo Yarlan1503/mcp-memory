@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-from mcp_memory.config import MAX_ENTITIES_PER_CALL, MAX_QUERY_LENGTH
+from mcp_memory.backpressure import bounded_heavy_tool
 from mcp_memory.entity_splitter import (
     analyze_entity_for_split,
     propose_entity_split,
@@ -27,6 +27,7 @@ def _preview_content(content: str, max_len: int = 80) -> str:
 # TOOL 12: analyze_entity_split
 # ============================================================
 @tool_error_handler
+@bounded_heavy_tool
 def analyze_entity_split(entity_name: str) -> dict[str, Any]:
     """Analyze an entity and determine if it needs to be split.
 
@@ -49,6 +50,7 @@ def analyze_entity_split(entity_name: str) -> dict[str, Any]:
 # TOOL 13: propose_entity_split
 # ============================================================
 @tool_error_handler
+@bounded_heavy_tool
 def propose_entity_split_tool(entity_name: str) -> dict[str, Any]:
     """Analyze and propose a split for an entity if needed.
 
@@ -68,6 +70,7 @@ def propose_entity_split_tool(entity_name: str) -> dict[str, Any]:
 # TOOL 14: execute_entity_split
 # ============================================================
 @tool_error_handler
+@bounded_heavy_tool
 def execute_entity_split_tool(
     entity_name: str,
     approved_splits: list[dict[str, Any]],
@@ -96,6 +99,7 @@ def execute_entity_split_tool(
 # TOOL 15: find_split_candidates
 # ============================================================
 @tool_error_handler
+@bounded_heavy_tool
 def find_split_candidates() -> dict[str, Any]:
     """Find all entities in the knowledge graph that are candidates for splitting.
 
@@ -112,6 +116,7 @@ def find_split_candidates() -> dict[str, Any]:
 # TOOL 16: find_duplicate_observations
 # ============================================================
 @tool_error_handler
+@bounded_heavy_tool
 def find_duplicate_observations(
     entity_name: str, threshold: float = 0.85, containment_threshold: float = 0.7
 ) -> dict[str, Any]:
@@ -153,8 +158,6 @@ def find_duplicate_observations(
     embeddings = engine.encode(contents)  # (n, 384)
 
     # 6. Pairwise cosine similarities (L2-normalised → dot product)
-    import numpy as np
-
     sim_matrix = embeddings @ embeddings.T  # (n, n)
 
     # 7. Union-Find for clustering above threshold
@@ -239,6 +242,7 @@ def find_duplicate_observations(
 # TOOL 17: consolidation_report
 # ============================================================
 @tool_error_handler
+@bounded_heavy_tool
 def consolidation_report(stale_days: float = 90.0) -> dict[str, Any]:
     """Generate a memory consolidation report without making any changes.
 

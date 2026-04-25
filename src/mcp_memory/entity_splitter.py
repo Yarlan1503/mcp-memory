@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-import sqlite3
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
@@ -899,8 +898,7 @@ def execute_entity_split(
     new_entity_ids: list[int] = []
     observations_moved = 0
 
-    store.db.execute("BEGIN IMMEDIATE")
-    try:
+    with store.write_transaction(immediate=True):
         # Create new entities and add observations
         for split in approved_splits:
             split_name = split["name"]
@@ -947,12 +945,6 @@ def execute_entity_split(
                 deleted,
                 entity_name,
             )
-
-        store.db.execute("COMMIT")
-    except Exception:
-        store.db.execute("ROLLBACK")
-        raise
-
     # Sync FTS for all affected entities (best-effort, post-commit)
     for eid in new_entity_ids + [original_id]:
         store._sync_fts(eid, auto_commit=True)
